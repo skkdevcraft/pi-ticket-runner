@@ -441,6 +441,9 @@ function fakeSession(
         getLastAssistantText() {
           return session.lastText;
         },
+        getTranscript() {
+          return [];
+        },
         dispose() {
           session.disposed += 1;
         },

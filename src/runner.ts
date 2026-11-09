@@ -335,6 +335,7 @@ export async function runTickets(options: RunTicketsOptions): Promise<RunOutcome
       options.observer?.frameStarted?.(ticket, {
         sessionFile: session.sessionFile,
         model: options.model?.id,
+        transcript: () => session.getTranscript(),
       });
 
       // A stop that landed while the session was being created must abort and

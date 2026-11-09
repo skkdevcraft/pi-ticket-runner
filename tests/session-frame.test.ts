@@ -20,8 +20,9 @@ import {
   SessionFrameController,
   SessionFrameRegistry,
 } from "../src/session-frames.ts";
+import type { TranscriptEntry } from "../src/transcript.ts";
 import type { Ticket } from "../src/tickets.ts";
-import { settled, textDelta, toolEnd, toolStart, turnEnd } from "./helpers.ts";
+import { settled, textDelta, thinkingDelta, messageEnd, toolEnd, toolStart, turnEnd } from "./helpers.ts";
 
 const SESSION_FILE = "/sessions/2025-01-01T00-00-00_0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.jsonl";
 const SHORT_ID = "0190a1";
@@ -53,6 +54,9 @@ function view(overrides: Partial<SessionFrameView> = {}): SessionFrameView {
     model: "gpt-5",
     childSessionFile: SESSION_FILE,
     expanded: false,
+    transcript: [],
+    expandedTranscriptMaxLines: 1_000,
+    expandedTranscriptMaxBytes: 131_072,
     now: 12_000,
     ...overrides,
   };
@@ -92,6 +96,10 @@ function fakeTheme(): FakeTheme {
       calls.push({ colour, text });
       return `[${colour}]${text}[/]`;
     },
+    bold: (text: string) => text,
+    italic: (text: string) => text,
+    underline: (text: string) => text,
+    strikethrough: (text: string) => text,
   } as unknown as Theme;
   return { theme, calls };
 }
@@ -200,6 +208,83 @@ describe("renderSessionFrame", () => {
       renderSessionFrame(view({ startedAt: 0, now: 125_000 }), 160),
     )[2] ?? "";
     assert.match(meta, /2m 05s/);
+  });
+
+  it("adds a separating rule and the transcript rows when expanded", () => {
+    const transcript: TranscriptEntry[] = [
+      { kind: "user", text: "Skill: implement · issues/03.md" },
+      { kind: "assistant", text: "Writing the repository layer." },
+    ];
+    const lines = sessionFrameText(
+      renderSessionFrame(view({ expanded: true, transcript }), 80, (entries) =>
+        entries.flatMap((entry) =>
+          entry.kind === "assistant"
+            ? [{ text: `md:${entry.text}` }]
+            : entry.kind === "user"
+              ? [{ text: entry.text }]
+              : [],
+        ),
+      ),
+    );
+
+    assert.match(lines[3] ?? "", /^├─+┤$/);
+    assert.match(lines[4] ?? "", /Skill: implement/);
+    assert.match(lines[5] ?? "", /md:Writing the repository layer\./);
+    assert.match(lines.at(-1) ?? "", /^└─+┘$/);
+    for (const line of lines) assert.equal(line.length, 80);
+  });
+
+  it("does not request a transcript while collapsed", () => {
+    let calls = 0;
+    const lines = renderSessionFrame(view({ expanded: false }), 80, () => {
+      calls += 1;
+      return [];
+    });
+
+    assert.equal(calls, 0);
+    assert.equal(lines.length, 4);
+  });
+
+  it("renders assistant Markdown and edit diffs inside the expanded border", () => {
+    const { theme } = fakeTheme();
+    const component = new SessionFrameComponent(
+      view({
+        expanded: true,
+        transcript: [
+          { kind: "assistant", text: "# Heading" },
+          {
+            kind: "tool",
+            callId: "call-1",
+            name: "edit",
+            summary: "src/a.ts",
+            diff: "+1 const a = 1;\n-1 const a = 0;",
+            isError: false,
+            finished: true,
+          },
+        ],
+      }),
+      theme,
+      { renderDiff: (diff) => diff.split("\n").map((line) => `diff:${line}`) },
+    );
+
+    const rendered = component.render(100).join("\n");
+    assert.match(rendered, /\[mdHeading\]Heading\[\/\]/);
+    assert.match(rendered, /Tool: edit src\/a\.ts — success/);
+    assert.match(rendered, /diff:\+1 const a = 1;/);
+    assert.match(rendered, /diff:-1 const a = 0;/);
+  });
+
+  it("paints transcript error rows in the error colour", () => {
+    const { theme, calls } = fakeTheme();
+    const lines = renderSessionFrame(
+      view({ expanded: true, transcript: [{ kind: "error", text: "boom" }] }),
+      80,
+      () => [{ text: "Error: boom", tone: "error" }],
+    );
+
+    const painted = lines.map((line) => paintSessionFrameLine(line, "failed", theme));
+    assert.match(painted.join("\n"), /\[error\]Error: boom\s*\[\/\]/);
+    assert.ok(calls.some((call) => call.colour === "error"));
   });
 });
 
@@ -404,5 +489,87 @@ describe("SessionFrameController", () => {
     controller.childEvent(settled());
 
     assert.equal(appended.length, 0);
+  });
+
+  it("renders a live expanded transcript and freezes it on settlement", () => {
+    const registry = new SessionFrameRegistry();
+    const appended: SessionFrameSummary[] = [];
+    const transcript: TranscriptEntry[] = [{ kind: "assistant", text: "first" }];
+    let reads = 0;
+    const controller = new SessionFrameController({
+      registry,
+      now: () => 1_000,
+      append: (value) => {
+        appended.push(value);
+        return `entry-${appended.length}`;
+      },
+    });
+
+    controller.start(ticket(), {
+      sessionFile: SESSION_FILE,
+      model: "gpt-5",
+      transcript: () => {
+        reads += 1;
+        return transcript;
+      },
+    });
+
+    const { theme } = fakeTheme();
+    const entry = frameEntry("entry-1", appended[0]);
+    const collapsed = registry.renderEntry(entry, false, theme);
+    assert.equal(reads, 0, "a collapsed frame never reads the transcript");
+    assert.ok(collapsed instanceof SessionFrameComponent);
+
+    const expanded = registry.renderEntry(entry, true, theme);
+    assert.ok(expanded instanceof SessionFrameComponent);
+    assert.match(expanded.render(80).join("\n"), /first/);
+
+    transcript.push({ kind: "assistant", text: "second" });
+    assert.match(expanded.render(80).join("\n"), /second/, "the live frame re-reads its transcript");
+
+    controller.settle("done");
+    transcript.push({ kind: "assistant", text: "after settlement" });
+    const settled = registry.renderEntry(entry, true, theme);
+    assert.ok(settled instanceof SessionFrameComponent);
+    assert.doesNotMatch(settled.render(80).join("\n"), /after settlement/);
+  });
+
+  it("streams visible assistant text into an expanded frame before persistence", () => {
+    const registry = new SessionFrameRegistry();
+    const appended: SessionFrameSummary[] = [];
+    let persisted: TranscriptEntry[] = [];
+    const controller = new SessionFrameController({
+      registry,
+      now: () => 1_000,
+      append: (value) => {
+        appended.push(value);
+        return `entry-${appended.length}`;
+      },
+    });
+
+    controller.start(ticket(), {
+      sessionFile: SESSION_FILE,
+      model: "gpt-5",
+      transcript: () => persisted,
+    });
+
+    controller.childEvent(textDelta("Hel"));
+    controller.childEvent(thinkingDelta("hidden reasoning"));
+    controller.childEvent(textDelta("lo"));
+
+    const { theme } = fakeTheme();
+    const expanded = registry.renderEntry(frameEntry("entry-1", appended[0]), true, theme);
+    assert.ok(expanded instanceof SessionFrameComponent);
+    assert.match(expanded.render(80).join("\n"), /Hello/);
+    assert.doesNotMatch(expanded.render(80).join("\n"), /hidden reasoning/);
+
+    persisted = [{ kind: "assistant", text: "Hello" }];
+    controller.childEvent(messageEnd());
+
+    const settledText = registry
+      .renderEntry(frameEntry("entry-1", appended[0]), true, theme)
+      ?.render(80)
+      .join("\n");
+    assert.equal(settledText?.match(/Hello/g)?.length, 1, "the persisted text replaces the delta");
   });
 });

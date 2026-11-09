@@ -324,6 +324,8 @@ async function runStart(
   const frames = new SessionFrameController({
     registry: frameRegistry,
     liveFrameUpdateIntervalMs: config.liveFrameUpdateIntervalMs,
+    expandedTranscriptMaxLines: config.expandedTranscriptMaxLines,
+    expandedTranscriptMaxBytes: config.expandedTranscriptMaxBytes,
     // Custom entries have no public update-in-place API. Re-publishing the
     // unchanged footer status requests a TUI render, and the frame renderer
     // reads the live view model on every render.

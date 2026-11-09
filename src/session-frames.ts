@@ -6,6 +6,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import { DEFAULT_CONFIG } from "./config.ts";
 import { ThrottledRepaint, type RepaintClock } from "./live-view.ts";
 import type { ChildEvent } from "./sessions.ts";
+import type { TranscriptEntry } from "./transcript.ts";
 import {
   FRAME_ENTRY_TYPE,
   SessionFrameComponent,
@@ -33,6 +34,10 @@ export interface SessionFrameControllerOptions {
   readonly repaint?: (() => void) | undefined;
   /** Minimum interval between live repaints, from `liveFrameUpdateIntervalMs`. */
   readonly liveFrameUpdateIntervalMs?: number | undefined;
+  /** Maximum lines shown in one expanded transcript. */
+  readonly expandedTranscriptMaxLines?: number | undefined;
+  /** Maximum UTF-8 bytes shown in one expanded transcript. */
+  readonly expandedTranscriptMaxBytes?: number | undefined;
   /** Timer seam for throttled repaints; tests supply a fake clock. */
   readonly clock?: RepaintClock | undefined;
 }
@@ -42,17 +47,24 @@ export interface SessionFrameRegistryOptions {
   readonly now?: (() => number) | undefined;
 }
 
+/** Display caps stored on one live frame. */
+export interface SessionFrameTranscriptLimits {
+  readonly maxLines: number;
+  readonly maxBytes: number;
+}
+
 /**
  * The in-memory half of one live frame.
  *
- * It owns only counters and identity. Child transcript content is never copied
- * here; the frame's expanded transcript is loaded separately.
+ * It owns only counters, identity, and (once the frame settles) a static
+ * transcript snapshot. Child transcript content is never persisted here.
  */
 export class LiveSessionFrame {
   readonly frameId: string;
   private readonly ticket: Ticket;
   private readonly child: SessionFrameChild;
   private readonly startedAt: number;
+  private readonly limits: SessionFrameTranscriptLimits;
 
   private status: SessionFrameStatus = "running";
   private turns = 0;
@@ -60,12 +72,24 @@ export class LiveSessionFrame {
   private errors = 0;
   private endedAt: number | undefined;
   private settled = false;
+  private expandedOnce = false;
+  private streamingText = "";
+  private finalTranscript: readonly TranscriptEntry[] | undefined;
 
-  constructor(ticket: Ticket, child: SessionFrameChild, startedAt: number) {
+  constructor(
+    ticket: Ticket,
+    child: SessionFrameChild,
+    startedAt: number,
+    limits: SessionFrameTranscriptLimits = {
+      maxLines: DEFAULT_CONFIG.expandedTranscriptMaxLines,
+      maxBytes: DEFAULT_CONFIG.expandedTranscriptMaxBytes,
+    },
+  ) {
     this.frameId = randomUUID();
     this.ticket = ticket;
     this.child = child;
     this.startedAt = startedAt;
+    this.limits = limits;
   }
 
   get isSettled(): boolean {
@@ -86,6 +110,22 @@ export class LiveSessionFrame {
         if (event.isError) this.errors += 1;
         break;
       case "message_update":
+        // Stream the visible assistant text into the expanded frame. Thinking
+        // deltas are deliberately ignored, and the buffer is bounded by the
+        // same byte cap the finished transcript uses.
+        if (event.assistantMessageEvent.type === "text_delta") {
+          const room = this.limits.maxBytes - Buffer.byteLength(this.streamingText, "utf8");
+          if (room > 0) this.streamingText += event.assistantMessageEvent.delta.slice(0, room);
+        }
+        break;
+      case "message_start":
+        // A new assistant message owns the streaming buffer again.
+        if (event.message.role === "assistant") this.streamingText = "";
+        break;
+      case "message_end":
+        // The persisted assistant message now carries the text; keep the buffer
+        // until the projection shows it so a synchronous repaint cannot flicker.
+        break;
       case "agent_settled":
         break;
     }
@@ -99,6 +139,10 @@ export class LiveSessionFrame {
     if (this.settled) return;
     this.status = status;
     this.endedAt = now;
+    // Snapshot the transcript before the child is disposed so a settled frame
+    // is static and never reads a disposed session. A frame that was never
+    // expanded materialises nothing.
+    if (this.expandedOnce) this.finalTranscript = [...this.transcript()];
     this.settled = true;
   }
 
@@ -119,6 +163,7 @@ export class LiveSessionFrame {
   }
 
   view(expanded: boolean, now: number): SessionFrameView {
+    if (expanded) this.expandedOnce = true;
     return {
       frameId: this.frameId,
       ticketId: this.ticket.id,
@@ -132,8 +177,29 @@ export class LiveSessionFrame {
       model: this.child.model,
       childSessionFile: this.child.sessionFile,
       expanded,
+      transcript: expanded ? this.transcript() : [],
+      expandedTranscriptMaxLines: this.limits.maxLines,
+      expandedTranscriptMaxBytes: this.limits.maxBytes,
       now,
     };
+  }
+
+  private transcript(): readonly TranscriptEntry[] {
+    if (this.finalTranscript !== undefined) return this.finalTranscript;
+
+    const projected = this.child.transcript?.() ?? [];
+    if (this.streamingText.length === 0) return projected;
+
+    // message_end persists the assistant message just after the event, so the
+    // in-flight delta is provisional only until the projection contains it.
+    for (let index = projected.length - 1; index >= 0; index -= 1) {
+      const entry = projected[index];
+      if (entry?.kind !== "assistant") continue;
+      if (entry.text === this.streamingText) return projected;
+      break;
+    }
+
+    return [...projected, { kind: "assistant", text: this.streamingText }];
   }
 }
 
@@ -226,6 +292,7 @@ export class SessionFrameController {
   private readonly now: () => number;
   private readonly repaint: (() => void) | undefined;
   private readonly repaintIntervalMs: number;
+  private readonly transcriptLimits: SessionFrameTranscriptLimits;
   private readonly clock: RepaintClock | undefined;
   private active: LiveSessionFrame | undefined;
   private repainter: ThrottledRepaint | undefined;
@@ -237,6 +304,12 @@ export class SessionFrameController {
     this.repaint = options.repaint;
     this.repaintIntervalMs =
       options.liveFrameUpdateIntervalMs ?? DEFAULT_CONFIG.liveFrameUpdateIntervalMs;
+    this.transcriptLimits = {
+      maxLines:
+        options.expandedTranscriptMaxLines ?? DEFAULT_CONFIG.expandedTranscriptMaxLines,
+      maxBytes:
+        options.expandedTranscriptMaxBytes ?? DEFAULT_CONFIG.expandedTranscriptMaxBytes,
+    };
     this.clock = options.clock;
   }
 
@@ -244,7 +317,7 @@ export class SessionFrameController {
   start(ticket: Ticket, child: SessionFrameChild): void {
     if (this.active !== undefined) this.settle("stopped");
 
-    const frame = new LiveSessionFrame(ticket, child, this.now());
+    const frame = new LiveSessionFrame(ticket, child, this.now(), this.transcriptLimits);
     this.active = frame;
     this.registry.registerLive(frame);
     this.persist(frame);

@@ -11,6 +11,8 @@ import {
   type LoadExtensionsResult,
 } from "@earendil-works/pi-coding-agent";
 
+import { projectTranscript, type TranscriptEntry } from "./transcript.ts";
+
 /** An event emitted by a child ticket session. */
 export type ChildEvent = AgentSessionEvent;
 
@@ -28,6 +30,8 @@ export interface TicketSession {
   abort(): Promise<void>;
   subscribe(listener: (event: ChildEvent) => void): () => void;
   getLastAssistantText(): string | undefined;
+  /** Read-only display projection of the child session's messages. */
+  getTranscript(): readonly TranscriptEntry[];
   dispose(): void;
 }
 
@@ -125,6 +129,10 @@ class SdkTicketSession implements TicketSession {
 
   getLastAssistantText(): string | undefined {
     return this.session.getLastAssistantText();
+  }
+
+  getTranscript(): readonly TranscriptEntry[] {
+    return projectTranscript(this.session.sessionManager.getBranch());
   }
 
   dispose(): void {

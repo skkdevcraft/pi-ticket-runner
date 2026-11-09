@@ -145,6 +145,9 @@ function fakeSessionFactory(options: FakeSessionOptions = {}): {
         getLastAssistantText() {
           return session.lastText;
         },
+        getTranscript() {
+          return [];
+        },
         dispose() {
           session.disposed += 1;
           session.events.push("dispose");

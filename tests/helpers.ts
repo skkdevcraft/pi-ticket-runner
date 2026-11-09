@@ -148,6 +148,20 @@ export function textDelta(delta: string): ChildEvent {
   } as unknown as ChildEvent;
 }
 
+/** A streamed thinking delta, which frames must never show. */
+export function thinkingDelta(delta: string): ChildEvent {
+  return {
+    type: "message_update",
+    message: { role: "assistant", content: [] },
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta },
+  } as unknown as ChildEvent;
+}
+
+/** A finalized child message, emitted before Pi persists its session entry. */
+export function messageEnd(message: unknown = { role: "assistant", content: [] }): ChildEvent {
+  return { type: "message_end", message } as unknown as ChildEvent;
+}
+
 /** A tool starting, as the child session emits it. */
 export function toolStart(name: string): ChildEvent {
   return {

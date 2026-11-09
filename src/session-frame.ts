@@ -1,7 +1,14 @@
 import { basename } from "node:path";
 
-import type { Theme } from "@earendil-works/pi-coding-agent";
-import type { Component } from "@earendil-works/pi-tui";
+import { renderDiff, type Theme } from "@earendil-works/pi-coding-agent";
+import { Markdown, truncateToWidth, type Component, type MarkdownTheme } from "@earendil-works/pi-tui";
+
+import { DEFAULT_CONFIG } from "./config.ts";
+import {
+  renderTranscript,
+  type TranscriptEntry,
+  type TranscriptLine,
+} from "./transcript.ts";
 
 /** Session entry type used to persist one frame summary per child session. */
 export const FRAME_ENTRY_TYPE = "ticket-runner-frame";
@@ -44,6 +51,13 @@ export interface SessionFrameSummary {
 export interface SessionFrameChild {
   readonly sessionFile: string | undefined;
   readonly model: string | undefined;
+  /**
+   * Read the child's current display transcript.
+   *
+   * Called only while the frame is expanded, so a collapsed frame never walks
+   * the child session entries.
+   */
+  readonly transcript?: (() => readonly TranscriptEntry[]) | undefined;
 }
 
 /** Everything the pure frame renderer needs. */
@@ -62,12 +76,16 @@ export interface SessionFrameView {
   readonly model: string | undefined;
   readonly childSessionFile: string | undefined;
   readonly expanded: boolean;
+  /** Projected child transcript. Empty while the frame is collapsed. */
+  readonly transcript: readonly TranscriptEntry[];
+  readonly expandedTranscriptMaxLines: number;
+  readonly expandedTranscriptMaxBytes: number;
   /** Epoch milliseconds used for the live elapsed time. */
   readonly now: number;
 }
 
 /** A colour role inside one rendered frame line. */
-export type SessionFrameTone = "border" | "status" | "dim";
+export type SessionFrameTone = "border" | "status" | "dim" | "error";
 
 /** One coloured span of a frame line. */
 export interface SessionFrameSegment {
@@ -79,25 +97,60 @@ export interface SessionFrameSegment {
 export type SessionFrameLine = readonly SessionFrameSegment[];
 
 /**
+ * Render one frame's transcript rows for the expanded body.
+ *
+ * Limits are the configured caps; the returned rows are in display order.
+ */
+export type SessionFrameTranscriptRenderer = (
+  entries: readonly TranscriptEntry[],
+  width: number,
+  limits: { readonly maxLines: number; readonly maxBytes: number },
+) => readonly TranscriptLine[];
+
+const defaultTranscriptRenderer: SessionFrameTranscriptRenderer = (entries, width, limits) =>
+  renderTranscript(entries, {
+    width,
+    maxLines: limits.maxLines,
+    maxBytes: limits.maxBytes,
+  });
+
+/**
  * Render one session frame from a view model.
  *
  * This is a pure function: the same view and width always produce the same
  * segments. The border always occupies the full supplied width, and every
- * content line is truncated to the space between the borders.
+ * content line is truncated to the space between the borders. An expanded
+ * frame inserts a separating rule and the projected transcript before the
+ * bottom border.
  */
-export function renderSessionFrame(view: SessionFrameView, width: number): SessionFrameLine[] {
+export function renderSessionFrame(
+  view: SessionFrameView,
+  width: number,
+  transcriptRenderer: SessionFrameTranscriptRenderer = defaultTranscriptRenderer,
+): SessionFrameLine[] {
   const outerWidth = Math.floor(width);
   if (!Number.isFinite(outerWidth) || outerWidth < 4) return [];
 
   const innerWidth = outerWidth - 4;
   const horizontal = "─".repeat(outerWidth - 2);
 
-  return [
+  const lines: SessionFrameLine[] = [
     [{ text: `┌${horizontal}┐`, tone: "border" }],
     contentLine(headerSegments(view), innerWidth),
     contentLine([{ text: "  " }, ...metaSegments(view)], innerWidth),
-    [{ text: `└${horizontal}┘`, tone: "border" }],
   ];
+
+  if (view.expanded) {
+    lines.push([{ text: `├${horizontal}┤`, tone: "border" }]);
+    const transcript = transcriptRenderer(view.transcript, innerWidth, {
+      maxLines: view.expandedTranscriptMaxLines,
+      maxBytes: view.expandedTranscriptMaxBytes,
+    });
+    for (const line of transcript) lines.push(transcriptLine(line, innerWidth));
+  }
+
+  lines.push([{ text: `└${horizontal}┘`, tone: "border" }]);
+  return lines;
 }
 
 /** Flatten a rendered frame line to its unstyled text. */
@@ -125,6 +178,8 @@ export function paintSessionFrameLine(
           return theme.fg(statusColour(status), segment.text);
         case "dim":
           return theme.fg("dim", segment.text);
+        case "error":
+          return theme.fg("error", segment.text);
         default:
           return segment.text;
       }
@@ -135,29 +190,53 @@ export function paintSessionFrameLine(
 /** A view snapshot, or a source that supplies the current live view. */
 export type SessionFrameViewSource = SessionFrameView | (() => SessionFrameView);
 
+/** Options for a frame component's rich renderers. */
+export interface SessionFrameComponentOptions {
+  readonly renderMarkdown?: ((text: string, width: number) => readonly string[]) | undefined;
+  readonly renderDiff?: ((diff: string) => readonly string[]) | undefined;
+}
+
 /**
  * A Pi component that renders one session frame.
  *
  * Pi caches custom entry components, so a live frame passes a view *source*
- * rather than a snapshot. Every render reads the current counters and status;
- * a repaint of the TUI is enough to show them. Static frames pass a plain view.
+ * rather than a snapshot. Every render reads the current counters, status, and
+ * transcript; a repaint of the TUI is enough to show them. Static frames pass a
+ * plain view.
  */
 export class SessionFrameComponent implements Component {
   private readonly source: SessionFrameViewSource;
   private readonly theme: Theme;
+  private readonly renderMarkdown: (text: string, width: number) => readonly string[];
+  private readonly renderDiff: (diff: string) => readonly string[];
 
-  constructor(view: SessionFrameViewSource, theme: Theme) {
+  constructor(
+    view: SessionFrameViewSource,
+    theme: Theme,
+    options: SessionFrameComponentOptions = {},
+  ) {
     this.source = view;
     this.theme = theme;
+    this.renderMarkdown =
+      options.renderMarkdown ??
+      ((text, width) => new Markdown(text, 0, 0, markdownTheme(theme)).render(width));
+    this.renderDiff = options.renderDiff ?? ((diff) => renderDiff(diff).split("\n"));
   }
 
   invalidate(): void {}
 
   render(width: number): string[] {
     const view = typeof this.source === "function" ? this.source() : this.source;
-    return renderSessionFrame(view, width).map((line) =>
-      paintSessionFrameLine(line, view.status, this.theme),
+    const lines = renderSessionFrame(view, width, (entries, innerWidth, limits) =>
+      renderTranscript(entries, {
+        width: innerWidth,
+        maxLines: limits.maxLines,
+        maxBytes: limits.maxBytes,
+        renderMarkdown: this.renderMarkdown,
+        renderDiff: this.renderDiff,
+      }),
     );
+    return lines.map((line) => paintSessionFrameLine(line, view.status, this.theme));
   }
 }
 
@@ -186,6 +265,7 @@ export function summaryToFrameView(
   summary: SessionFrameSummary,
   expanded: boolean,
   now: number,
+  limits: { readonly maxLines?: number | undefined; readonly maxBytes?: number | undefined } = {},
 ): SessionFrameView {
   const startedAt = Date.parse(summary.startedAt);
   const endedAt = summary.endedAt === undefined ? undefined : Date.parse(summary.endedAt);
@@ -203,6 +283,9 @@ export function summaryToFrameView(
     model: summary.model,
     childSessionFile: summary.childSessionFile,
     expanded,
+    transcript: [],
+    expandedTranscriptMaxLines: limits.maxLines ?? DEFAULT_CONFIG.expandedTranscriptMaxLines,
+    expandedTranscriptMaxBytes: limits.maxBytes ?? DEFAULT_CONFIG.expandedTranscriptMaxBytes,
     now,
   };
 }
@@ -299,6 +382,35 @@ function contentLine(content: readonly SessionFrameSegment[], innerWidth: number
     { text: padding },
     { text: " │", tone: "border" },
   ];
+}
+
+function transcriptLine(line: TranscriptLine, innerWidth: number): SessionFrameLine {
+  const text = truncateToWidth(line.text, innerWidth, "…", true);
+  return [
+    { text: "│ ", tone: "border" },
+    line.tone === undefined ? { text } : { text, tone: line.tone },
+    { text: " │", tone: "border" },
+  ];
+}
+
+/** Build the Markdown theme from a Pi theme so injected themes stay testable. */
+function markdownTheme(theme: Theme): MarkdownTheme {
+  return {
+    heading: (text) => theme.fg("mdHeading", theme.bold(text)),
+    link: (text) => theme.fg("mdLink", text),
+    linkUrl: (text) => theme.fg("mdLinkUrl", text),
+    code: (text) => theme.fg("mdCode", text),
+    codeBlock: (text) => theme.fg("mdCodeBlock", text),
+    codeBlockBorder: (text) => theme.fg("mdCodeBlockBorder", text),
+    quote: (text) => theme.fg("mdQuote", text),
+    quoteBorder: (text) => theme.fg("mdQuoteBorder", text),
+    hr: (text) => theme.fg("mdHr", text),
+    listBullet: (text) => theme.fg("mdListBullet", text),
+    bold: (text) => theme.bold(text),
+    italic: (text) => theme.italic(text),
+    underline: (text) => theme.underline(text),
+    strikethrough: (text) => theme.strikethrough(text),
+  };
 }
 
 function truncateSegments(
