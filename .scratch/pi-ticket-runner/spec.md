@@ -1,6 +1,7 @@
 # pi-ticket-runner — Extension Specification
 
 > Status: settled via grilling. Supersedes `docs/idea.md` (now a pointer stub).
+> Revision: inline session frames replace the live widget (§11). See `docs/adr/0001-inline-session-frames.md`.
 > Repo conventions: see `AGENTS.md`, `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md`.
 
 ## 1. Overview
@@ -21,7 +22,7 @@ The extension is responsible only for:
 - Reading their ordering and execution status.
 - Executing executable tickets sequentially.
 - Managing persistent child sessions.
-- Displaying live execution progress.
+- Displaying live execution progress as inline session frames.
 - Stopping when execution fails, is interrupted, or fails the completion gate.
 
 **Core principle:** ticket files are the single persistent source of truth for status. The extension maintains no run log, completion database, or execution-history file.
@@ -46,7 +47,7 @@ The extension is responsible only for:
 
 7. **Ticket-file status persistence** — the child session records completion in the existing ticket file using the project's ticket-tracker conventions. No separate run state is persisted.
 
-8. **Live TUI visibility** — stream the active ticket session's output into a widget in the main Pi TUI.
+8. **Live TUI visibility** — render every ticket session as an inline, collapsible session frame in the main Pi transcript, with the active frame updating live.
 
 9. **Interruptible execution** — allow the user to stop the active child session and the entire sequential run.
 
@@ -75,6 +76,8 @@ The extension is responsible only for:
 - Binding `Esc` to child-session cancellation.
 - Git worktree isolation or automatic rollback.
 - Custom tool sandboxing or permission management.
+- Patching Pi's private TUI internals to group native tool and assistant components.
+- Per-frame click targets or independent expansion controls in v1.
 
 ---
 
@@ -302,7 +305,7 @@ The command must:
 2. Abort the current child session and await the abort.
 3. Prevent the scheduler from starting another ticket.
 4. Remove the child event subscription and dispose the child session.
-5. Clear the live TUI widget.
+5. Settle the active session frame as `stopped`; it remains in the transcript.
 6. Update the footer.
 7. Release the execution lock.
 8. Unblock main-session input.
@@ -346,7 +349,7 @@ for each ticket in numeric order:
 
     create fresh persistent AgentSession
     subscribe to child events
-    display live output widget
+    append the session frame and start live updates
 
     invoke /skill:implement <ticket-reference>
     await the complete agent run, counting turn_end events
@@ -374,12 +377,13 @@ for each ticket in numeric order:
         dispose child, stop run
         report "reported COMPLETE but ticket file remains ready-for-agent"
 
+    settle the session frame as done
     dispose child, remove subscription
-    update progress, show next ticket in widget
+    update the footer to the next ticket
     continue to next ticket
 
 release repository execution lock
-clear active TUI widget and footer
+settle any active frame and clear the footer
 report final progress
 ```
 
@@ -578,7 +582,7 @@ When cancellation is requested:
 3. Stop the sequential loop.
 4. Unsubscribe and dispose the child.
 5. Preserve the child session file.
-6. Clear the widget, update the footer.
+6. Settle the active session frame as `stopped`, update the footer.
 7. Release the execution lock.
 8. Report the interruption.
 
@@ -588,7 +592,7 @@ The extension must not continue to the next ticket, retry the interrupted ticket
 
 No keyboard shortcut is bound to child cancellation in v1. `Esc` remains the main session's own escape handler and is never hijacked, because binding it to a different session would override a core key for no added capability.
 
-The widget advertises only `/ticket-runner stop`.
+The running frame advertises only `/ticket-runner stop`.
 
 ### 8.4 Cancellation Race Safety
 
@@ -684,6 +688,8 @@ A failed or interrupted ticket is not reverted. The extension reports that the w
 
 ## 11. Live TUI Visibility
 
+The extension renders progress in two places: the footer and one inline **session frame** per child session. It installs no persistent widget above the editor.
+
 ### 11.1 Footer Progress
 
 While a run is active, use `ctx.ui.setStatus("ticket-runner", …)`:
@@ -697,25 +703,109 @@ While a run is active, use `ctx.ui.setStatus("ticket-runner", …)`:
 
 On finish: `🎫 done · 0 left`. On failure or interruption: `🎫 stopped · 2 left`. Cleared on teardown.
 
-### 11.2 Live Session Widget
+### 11.2 Session Frames
 
-While a ticket runs, use `ctx.ui.setWidget("ticket-runner", lines)` above the editor. At most six lines:
+A **session frame** is a durable, TUI-only custom entry. Register it with `pi.registerEntryRenderer("ticket-runner-frame", …)` and append its summary with `pi.appendEntry("ticket-runner-frame", summary)`. A frame never enters the main agent's LLM context and is read-only. The public-API choice is recorded in `docs/adr/0001-inline-session-frames.md`.
+
+Exactly one frame is visible per child session. A frame is created when the child session is created and settles when the child is disposed. Skipped tickets and failures before child creation produce no frame.
+
+Collapsed:
 
 ```text
-▶ 03 Repository Layer
-  Writing src/repository.ts…
-  Wiring the schema migration…
-  + added src/repository.ts
-  Tool: edit — success
-  (/ticket-runner stop to interrupt)
+┌──────────────────────────────────────────────────────────────────────┐
+│ ▸ ● 03 Repository Layer · Running                                    │
+│   3 turns • 2 tools • 0 errors • 12s • gpt-5 • /ticket-runner stop   │
+│   (ctrl+o to expand)                                                 │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-- Header: `▶ <NN> <title>`.
-- Up to three lines of recent assistant text, each truncated to the terminal width.
-- One line for the current or most recent tool: `Tool: <name> — running|success|error`.
-- The interruption hint — always `/ticket-runner stop`; never `Esc`.
+Expanded:
 
-During the completion gate the header becomes `🔎 03 verifying completion` and the body shows the gate's streamed output. Between tickets, render `⏳ next: 04-integration-tests` instead of clearing, so a long run never looks dead.
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│ ▾ ● 03 Repository Layer · Running                                    │
+│   Session 1a2b3c · 3 turns • 2 tools • 0 errors • 12s • gpt-5        │
+├──────────────────────────────────────────────────────────────────────┤
+│ Skill: implement · .scratch/auth/issues/03-repository-layer.md       │
+│ Writing the repository layer…                                        │
+│ Tool: write src/repository.ts — success                              │
+│ …                                                                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Frame requirements:
+
+- **Border.** Draw a literal border with `┌ ─ ┐ │ ├ ┤ └ ┘` in `theme.fg("borderMuted", …)`. Do not use a background box.
+- **Toggle glyph.** `▸` collapsed, `▾` expanded.
+- **Status dot.** `●`, coloured by status: `running` and `verifying` use `warning`, `done` uses `success`, `stopped` uses `warning`, `failed` uses `error`.
+- **Header.** `<glyph> ● <NN> <title> · <Status>`.
+- **Meta.** `<N> turns • <N> tools • <N> errors • <elapsed> • <model> (ctrl+o)`. While the child is running, append `• /ticket-runner stop`. Expanded frames prepend `Session <short-id> · ` to the meta line.
+- **Status words.** `running`, `verifying`, `done`, `stopped`, `failed`. Display labels capitalize the first letter. `verifying` is the completion-gate phase of the same frame; it never creates a second frame.
+- **`done` meaning.** The gate returned `COMPLETE` and the persisted ticket status is no longer runnable. `done` does not claim the ticket is complete in the abstract.
+- **`stopped` meaning.** Gate rejection, malformed gate answer, unchanged ticket status, turn limit, or user interrupt on an active child frame.
+- **`failed` meaning.** A child-session error. Deliberate stops are never `failed`.
+- **Terminal width.** Frame lines are truncated to the available width. The border uses the full available width.
+
+#### Expansion
+
+`Ctrl+O` is the single expansion control. It toggles all session frames between collapsed and expanded, matching Pi's native `app.tools.expand` behaviour. A new frame starts collapsed unless the global expansion state is currently expanded. Expansion state is not persisted across reload.
+
+There is no compact intermediate child layer and no per-frame click target in v1. `Ctrl+O` goes directly from the collapsed summary to the full child transcript.
+
+The active frame updates live while the child runs. Assistant text streams, tool rows appear as they start and finish, and status/counts update. Completed frames are static.
+
+#### Expanded transcript
+
+The expanded frame renders the child session transcript as read-only rows:
+
+- The initial user turn appears as one compact line: `Skill: implement · <ticket-reference>`.
+- The completion-gate user turn appears as one compact line: `Gate: verify completion · <ticket-reference>`.
+- Assistant text is rendered in full with `Markdown`.
+- Each tool call is rendered as a `Tool: <name> <compact-args>` row, followed by its full result text.
+- Edit diffs are rendered with `renderDiff`; write results show their full content.
+- Tool errors and failed results are shown in the error colour.
+
+Excluded from the frame: the system prompt, the expanded `implement` skill body, and thinking blocks. They remain available through `/resume`.
+
+The expanded transcript is capped at **1,000 lines or 128 KB** per frame, whichever comes first. When either limit is reached, append:
+
+```text
+… truncated · open the child session in /resume for the full transcript
+```
+
+The cap is display-only. The complete transcript remains in the child session file. Do not instantiate Pi's native interactive `AssistantMessageComponent` or `ToolExecutionComponent` inside the frame; render with `Markdown`, `Text`, and `renderDiff`.
+
+#### Persistence
+
+Each frame has a stable `frameId`. Append a small summary entry when the frame is created and again when it settles. The summary contains only:
+
+```typescript
+{
+  frameId: string;
+  ticketId: string;
+  ticketTitle: string;
+  childSessionFile: string | undefined;
+  model: string | undefined;
+  status: "running" | "verifying" | "done" | "stopped" | "failed";
+  turns: number;
+  tools: number;
+  errors: number;
+  startedAt: string;
+  endedAt?: string;
+}
+```
+
+The summary never contains transcript content. On session start, scan `ticket-runner-frame` entries and render only the latest entry for each `frameId`; renderers for superseded entries return no content, so exactly one frame is visible per child session.
+
+The expanded transcript is loaded on demand from `childSessionFile` using the public `SessionManager.open()` API, or from the live child session's entries while it is running. Cache it only while expanded; drop the cache on collapse and teardown. If the file is missing or unreadable, render:
+
+```text
+Transcript unavailable · <reason>
+```
+
+If the child session has no messages yet, render `Transcript not yet available.`
+
+Session frames and expanded transcripts are TUI-only. They are never sent to the model.
 
 ### 11.3 Event Subscription
 
@@ -724,14 +814,14 @@ const unsubscribe = session.subscribe((event) => {
   switch (event.type) {
     case "message_update":
       if (event.assistantMessageEvent.type === "text_delta") {
-        // append to a bounded rolling text buffer
+        // append to the active assistant row and update the frame
       }
       break;
     case "tool_execution_start":
-      // record current tool name
+      // add a running tool row
       break;
     case "tool_execution_end":
-      // record tool outcome
+      // settle the tool row and record its result/error
       break;
     case "turn_end":
       // increment the per-ticket turn counter
@@ -747,13 +837,16 @@ The subscription is removed before the session is disposed.
 
 ### 11.4 Rendering Performance
 
-Widget updates are throttled to `liveWidgetUpdateIntervalMs` (default 150 ms). Only a bounded rolling buffer of the latest text is retained in the parent process; the complete transcript lives in the child session.
+Live frame updates are throttled to `liveFrameUpdateIntervalMs` (default 150 ms). Only the bounded expanded view is materialised, and only while at least one frame is expanded. The complete transcript remains in the child session file.
 
-Never retain or render the full child transcript from the parent.
+Never copy a full child transcript into the parent's LLM context or into the persisted frame summary.
 
-### 11.5 Widget Cleanup
+### 11.5 Frame Settlement and Cleanup
 
-Clear the widget when the run finishes, fails, is interrupted, and when the extension shuts down or reloads.
+- Normal completion: settle the frame as `done`, update the footer, keep the frame in the transcript.
+- Stop or failure: settle the frame as `stopped` or `failed`, update the footer, keep the frame in the transcript.
+- Shutdown or reload mid-run: settle the active frame as `stopped` before disposing the child.
+- Teardown: clear the footer and drop expanded-transcript caches. Never delete session frames or child session files.
 
 ---
 
@@ -792,7 +885,9 @@ Completion:
 Ran: 03, 05. Skipped: 04 (ready-for-human).
 ```
 
-Never injected: child transcripts, long tool output, diffs, implementation summaries, or ticket bodies.
+Session frames and their expanded transcripts are TUI-only custom entries. They are never sent to the model.
+
+Never injected into LLM context: child transcripts, long tool output, diffs, implementation summaries, or ticket bodies.
 
 ### 12.2 Main-Session Input While Running
 
@@ -824,7 +919,9 @@ Implement against the pinned Pi SDK `@earendil-works/pi-coding-agent` (currently
 | `pi.on("input")` | Block main-session prompts during a run (§12.2) |
 | `pi.on("session_shutdown")` | Abort child, release lock, clear UI |
 | `ctx.ui.setStatus()` | Footer progress |
-| `ctx.ui.setWidget()` | Live child output |
+| `pi.appendEntry()` | Append a session-frame summary |
+| `pi.registerEntryRenderer()` | Render inline session frames and expanded transcripts |
+| `SessionManager.open()` | Read a child transcript on demand for expansion |
 | `ctx.ui.notify()` | Failure and interruption notices |
 | `pi.sendMessage()` | Concise progress in the transcript |
 | `pi.getCommands()` | Verify `skill:implement` discoverability |
@@ -870,9 +967,10 @@ Cleanup runs on stop, extension reload, `session_shutdown`, and unrecoverable er
 1. Set the cancellation flag.
 2. Abort active child work and await it.
 3. Remove event subscriptions.
-4. Dispose the child session (never deleting the session file).
-5. Clear the widget and footer.
-6. Release the execution lock.
+4. Settle the active session frame as `stopped`.
+5. Dispose the child session (never deleting the session file).
+6. Clear the footer and expanded-transcript caches.
+7. Release the execution lock.
 
 ---
 
@@ -884,17 +982,23 @@ Configuration is loaded from `~/.pi/agent/ticket-runner.json` and `.pi/ticket-ru
 |---|---|---|
 | `runnableStatuses` | `["ready-for-agent"]` | Status values eligible for execution; every other value is skipped |
 | `maxTurnsPerTicket` | `50` | Maximum child `turn_end` events during the implementation prompt |
-| `liveWidgetUpdateIntervalMs` | `150` | Minimum interval between widget renders |
+| `liveFrameUpdateIntervalMs` | `150` | Minimum interval between live session-frame renders |
+| `expandedTranscriptMaxLines` | `1000` | Maximum lines rendered in one expanded child transcript |
+| `expandedTranscriptMaxBytes` | `131072` | Maximum UTF-8 bytes rendered in one expanded child transcript |
 | `staleLockHours` | `12` | Age after which an unreadable-PID lock is reported as stale |
 
 ```json
 {
   "runnableStatuses": ["ready-for-agent"],
   "maxTurnsPerTicket": 50,
-  "liveWidgetUpdateIntervalMs": 150,
+  "liveFrameUpdateIntervalMs": 150,
+  "expandedTranscriptMaxLines": 1000,
+  "expandedTranscriptMaxBytes": 131072,
   "staleLockHours": 12
 }
 ```
+
+`liveWidgetUpdateIntervalMs` is accepted as a deprecated alias for `liveFrameUpdateIntervalMs`; when both are present, `liveFrameUpdateIntervalMs` wins.
 
 ### 14.1 Turn Limit Behavior
 
@@ -937,10 +1041,17 @@ Reaching the turn limit is never treated as success.
 | Runner started again | Re-read tickets; start from the first runnable |
 | Second runner in same repo | Refuse via lock; report stale locks explicitly |
 | User prompts main session mid-run | Blocked with a stop-command hint |
-| Branch or `HEAD` changes mid-run | Stop |
+| Branch or `HEAD` changes mid-run | Stop; no frame is created for the unstarted ticket |
 | Unrelated dirty tree at start | Refuse unless `--allow-dirty` |
 | Failed ticket leaves code changes | Preserve; never auto-revert |
 | Session picker opened | Child sessions remain available through Pi's persistence |
+| Ticket skipped | No session frame is created |
+| Failure before child session creation | No session frame is created |
+| Expanded transcript exceeds the cap | Truncate with the footer; the full transcript stays in the child session file |
+| `Ctrl+O` with multiple frames | All frames toggle; each expanded transcript is capped independently |
+| Child session file missing or unreadable | Render `Transcript unavailable · <reason>`; never crash |
+| Pi reloads mid-ticket | The active frame settles as `stopped`; the latest frame per child is restored |
+| Same ticket run twice | Two frames; expanded headers distinguish them by session ID |
 
 ---
 
@@ -984,7 +1095,7 @@ Given `01 resolved`, `02 resolved`, `03 ready-for-agent`, `04 ready-for-human`, 
 ### 16.6 Interruption
 
 - `/ticket-runner stop` aborts the child and stops the loop.
-- The session file is retained; the widget is cleared; the lock is released.
+- The session file is retained; the active frame settles as `stopped`; the footer is cleared; the lock is released.
 - No ticket is falsely advanced.
 
 ### 16.7 Session Persistence
@@ -995,10 +1106,16 @@ Given `01 resolved`, `02 resolved`, `03 ready-for-agent`, `04 ready-for-human`, 
 ### 16.8 TUI
 
 - Footer shows remaining-runnable counts.
-- The widget shows header, recent text, tool activity, and the stop hint.
-- Widget updates are throttled and bounded.
-- The gate phase is visible.
-- Widget and footer clear on teardown.
+- Every child session produces exactly one inline frame; skipped tickets and pre-session failures produce none.
+- Collapsed frames show the ticket identity, status, turns, tools, errors, elapsed time, model, `(ctrl+o)`, and the stop hint while running.
+- `Ctrl+O` toggles all frames; new frames inherit the global state; expansion state is not persisted.
+- The active expanded frame updates live; completed frames are static.
+- Expanded transcripts include assistant text, tool calls/results/diffs, and compact ticket/gate prompts; they exclude the system prompt, expanded skill body, and thinking.
+- Expanded transcripts respect the line/byte cap and show the truncation footer.
+- Gate phase appears as `verifying` on the same frame.
+- Session frames survive reload; the latest entry per frame is rendered.
+- Frames and expanded transcripts never enter LLM context.
+- The footer clears on teardown; frames remain.
 
 ### 16.9 Restart
 
@@ -1018,17 +1135,22 @@ Core logic is tested through a `TicketSession` port:
 
 ```typescript
 interface TicketSession {
+  readonly sessionFile: string | undefined;
   prompt(text: string): Promise<void>;
   abort(): Promise<void>;
   subscribe(listener: (event: ChildEvent) => void): () => void;
   getLastAssistantText(): string | undefined;
+  getTranscript(): readonly TranscriptEntry[];
   dispose(): void;
 }
 ```
 
+`TranscriptEntry` is a read-only projection of one child message: a compact user turn, assistant text, a tool call/result, or an error. It is not the raw Pi session entry.
+
 - Pure units (discovery, ordering, status parsing, gate parsing, config, lock) tested directly.
 - The loop, cancellation races, turn limits, and cleanup tested against a fake `TicketSession`.
-- TUI tested by asserting widget/status payloads.
+- Frame and transcript rendering tested as pure functions over fixture `TranscriptEntry` values.
+- TUI tested by asserting frame view-model/render output and footer payloads, not widget payloads.
 - One opt-in integration test (env-gated) drives a real session against a scratch repo.
 
 ---
@@ -1046,6 +1168,9 @@ interface TicketSession {
 - Independent acceptance-criteria verification.
 - Automatic repair retries.
 - Optional `Esc` binding.
+- Per-frame click targets and independent expansion controls.
+- Transcript search and filtering inside expanded frames.
+- Native Pi component fidelity for expanded tool rows.
 
 ---
 
@@ -1089,15 +1214,19 @@ pi-ticket-runner/
 │   ├── lock.ts              # repository execution lock
 │   ├── git.ts               # preflight and branch/HEAD checks
 │   ├── sessions.ts          # TicketSession port + SDK adapter
+│   ├── transcript.ts        # child transcript projection for frames
+│   ├── live-view.ts         # frame lifecycle and event-to-frame state
 │   ├── gate.ts              # prompt construction and result parsing
 │   ├── runner.ts            # sequential loop and cancellation
-│   └── ui.ts                # widget, footer, progress rendering
+│   └── ui.ts                # footer, session frame, and transcript rendering
 ├── tests/
 │   ├── tickets.test.ts
 │   ├── status.test.ts
 │   ├── gate.test.ts
 │   ├── lock.test.ts
 │   ├── runner.test.ts       # fake TicketSession
+│   ├── live-view.test.ts    # frame lifecycle and view model
+│   ├── transcript.test.ts   # transcript projection and rendering
 │   └── integration.test.ts  # env-gated, real session
 ├── .gitignore               # .pi/*.lock
 ├── README.md
@@ -1121,6 +1250,8 @@ The implementation favors minimal code and clear responsibility boundaries over 
 9. **Persist sessions, not orchestration history.** Pi stores transcripts; ticket files store status.
 10. **Keep the parent context small.** Progress lines only.
 11. **One agent per tree.** Block main-session prompts while a run is active.
+12. **Frames are TUI-only.** Expanded transcripts never enter the model context.
+13. **Use public Pi seams.** Never patch private TUI internals to group native components.
 
 ---
 
@@ -1138,8 +1269,8 @@ The implementation favors minimal code and clear responsibility boundaries over 
 | 8 | Git preflight runs once at start (with `--allow-dirty`); branch/`HEAD` are re-checked per ticket. |
 | 9 | Lock file at `.pi/ticket-runner.lock`; stale locks reported, never auto-deleted. |
 | 10 | Main-session prompts are blocked during a run via the `input` handler; extension commands still work. |
-| 11 | No `Esc` binding; the widget advertises only `/ticket-runner stop`. |
-| 12 | Widget is six lines, 150 ms throttle, gate phase labelled, next ticket shown between tickets. |
+| 11 | No `Esc` binding; the running frame advertises only `/ticket-runner stop`. |
+| 12 | The editor widget is removed. Each child session renders one inline session frame, updated live at 150 ms and settled on completion. |
 | 13 | Turns counted from `turn_end` during implementation only; default cap 50; breach aborts and stops. |
 | 14 | Gate parsing tolerates emphasis and fences, not vocabulary. |
 | 15 | Titles come from the H1 heading, falling back to the filename slug. |
@@ -1147,6 +1278,15 @@ The implementation favors minimal code and clear responsibility boundaries over 
 | 17 | Progress via `pi.sendMessage(..., { triggerTurn: false })`. |
 | 18 | `TicketSession` port as the test seam, plus one env-gated integration test. |
 | 19 | This spec lives at `.scratch/pi-ticket-runner/spec.md`; tickets follow via `/to-tickets`. |
+| 20 | One session frame per child session; no run-level frame and no nested frames. |
+| 21 | Frames use public `pi.appendEntry()` + `pi.registerEntryRenderer()` only; no private Pi TUI patching. |
+| 22 | `Ctrl+O` is one-layer: collapsed summary to full child transcript, with no compact intermediate child layer. |
+| 23 | Expanded transcripts include assistant text, tool calls/results/diffs, and compact ticket/gate prompts; exclude the system prompt, expanded skill body, and thinking. |
+| 24 | Each expanded transcript is capped at 1,000 lines or 128 KB, with a truncation footer pointing to `/resume`. |
+| 25 | Frame statuses are `running`, `verifying`, `done`, `stopped`, `failed`; `done` requires a `COMPLETE` gate and a non-runnable persisted status. |
+| 26 | `Ctrl+O` toggles all frames; new frames inherit the global state; expansion state is not persisted. |
+| 27 | Each frame persists only a small summary entry; the expanded transcript is read lazily from the child session file and never enters LLM context. |
+| 28 | No per-frame click targets or independent expansion controls in v1. |
 
 ## Appendix B — Next Step
 

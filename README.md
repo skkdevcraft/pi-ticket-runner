@@ -13,7 +13,7 @@ The main session keeps only the ticket inventory, progress, and status. Implemen
 - Skips every non-runnable ticket automatically — no selection dialog, no confirmation.
 - Invokes the installed `/skill:implement <ticket-file>` skill in a **fresh, persistent Pi session per ticket**.
 - Sends one completion-gate prompt after implementation, then advances only if the gate says `COMPLETE` **and** the ticket file's status has actually changed.
-- Streams live progress into a TUI widget and a footer status.
+- Renders each ticket session as an inline, collapsible **session frame** in the transcript, plus a footer status.
 - Stops conservatively on errors, failed gates, turn limits, interrupts, or mid-run Git changes.
 
 **Not** a general sub-agent framework, ticket generator, or ticket tracker. Ticket generation and implementation methodology stay with the [Matt Pocock skills](https://github.com/mattpocock/skills).
@@ -120,11 +120,15 @@ Shows the active run (folder, current ticket, how many runnable tickets remain, 
 
 ### `/ticket-runner stop`
 
-The guaranteed way to interrupt a run. It aborts the active child session, stops the loop, clears the widget, and releases the repository lock. The child session file is preserved and remains visible in `/resume`. Nothing is rolled back.
+The guaranteed way to interrupt a run. It aborts the active child session, stops the loop, settles the active session frame as `stopped`, and releases the repository lock. The child session file is preserved and remains visible in `/resume`. Nothing is rolled back.
 
 `Esc` is deliberately **not** bound: it stays the main session's own key handler.
 
 While a run is active, ordinary prompts to the main session are blocked (run `/ticket-runner stop` first). Extension commands such as `status`, `list`, and `stop` keep working.
+
+### Session frames
+
+Each child session appears in the main transcript as one bordered, collapsible frame. Collapsed, it shows the ticket, status, turns, tools, errors, elapsed time, model, and `(ctrl+o)`. Press `Ctrl+O` to expand all frames to the child transcript; press it again to collapse them. The active frame updates live. Expanded transcripts are capped at 1,000 lines or 128 KB per frame, with the full history always available in `/resume`. Frames are TUI-only and never enter the main session's model context.
 
 ---
 
@@ -191,7 +195,9 @@ Missing files are fine. Unknown keys produce a warning; invalid values stop the 
 {
   "runnableStatuses": ["ready-for-agent"],
   "maxTurnsPerTicket": 50,
-  "liveWidgetUpdateIntervalMs": 150,
+  "liveFrameUpdateIntervalMs": 150,
+  "expandedTranscriptMaxLines": 1000,
+  "expandedTranscriptMaxBytes": 131072,
   "staleLockHours": 12
 }
 ```
@@ -200,8 +206,12 @@ Missing files are fine. Unknown keys produce a warning; invalid values stop the 
 |---|---|---|
 | `runnableStatuses` | `["ready-for-agent"]` | Status values eligible for execution; everything else is skipped |
 | `maxTurnsPerTicket` | `50` | Maximum child `turn_end` events during implementation; exceeding it aborts and stops |
-| `liveWidgetUpdateIntervalMs` | `150` | Minimum interval between live widget renders |
+| `liveFrameUpdateIntervalMs` | `150` | Minimum interval between live session-frame renders |
+| `expandedTranscriptMaxLines` | `1000` | Maximum lines rendered in one expanded child transcript |
+| `expandedTranscriptMaxBytes` | `131072` | Maximum UTF-8 bytes rendered in one expanded child transcript |
 | `staleLockHours` | `12` | Age after which an unreadable-PID lock is reported as stale |
+
+`liveWidgetUpdateIntervalMs` is accepted as a deprecated alias for `liveFrameUpdateIntervalMs`.
 
 ---
 
