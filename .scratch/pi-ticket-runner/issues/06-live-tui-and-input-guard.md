@@ -16,3 +16,7 @@
 - [x] Widget and footer are cleared when the run finishes, fails, is interrupted, and when the extension shuts down or reloads.
 - [x] While a run is active, ordinary main-session prompts are handled with a notice naming the active ticket and the stop command; extension commands and runner-injected messages are unaffected.
 - [x] Widget payloads, footer payloads, throttling, bounded buffering, gate-phase rendering, next-ticket rendering, input blocking, and teardown clearing are covered by tests.
+
+## Comments
+
+Partially superseded by 08–12: the inline session-frame design in the revised spec replaces this ticket's six-line editor widget. Ticket 09 removes the widget; the child-event subscription, footer progress, and input guard delivered here remain.
