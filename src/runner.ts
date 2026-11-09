@@ -9,6 +9,7 @@ import {
   type GateStatus,
 } from "./gate.ts";
 import type { RunObserver } from "./live-view.ts";
+import type { SessionFrameStatus } from "./session-frame.ts";
 import type { TicketRunState } from "./run-state.ts";
 import {
   openRepositoryGuard,
@@ -331,25 +332,32 @@ export async function runTickets(options: RunTicketsOptions): Promise<RunOutcome
       }
 
       const handle = cancellation.attach(() => session.abort());
+      options.observer?.frameStarted?.(ticket, {
+        sessionFile: session.sessionFile,
+        model: options.model?.id,
+      });
 
       // A stop that landed while the session was being created must abort and
       // dispose this child without prompting it.
       if (cancellation.cancelled) {
         await handle.aborted();
         handle.detach();
+        options.observer?.frameSettled?.("stopped");
         session.dispose();
         return stopped(options, readStatus, ran, skipped, { kind: "interrupted", ticket });
       }
 
       options.state?.setSessionFile(session.sessionFile);
 
-      let attempt: TicketAttempt;
+      let attempt: TicketAttempt | undefined;
       try {
         attempt = await runTicketAttempt(session, ticket, options, readStatus, cancellation);
       } finally {
-        // The subscription is removed inside the attempt. Detach before waiting
-        // so no abort can start after this point; dispose never deletes the
-        // persisted session file.
+        // Settlement happens before disposal so a reload can never find an
+        // active frame that still reports running. The subscription is removed
+        // inside the attempt. Detach before waiting so no abort can start after
+        // this point; dispose never deletes the persisted session file.
+        options.observer?.frameSettled?.(frameStatus(attempt, cancellation.cancelled));
         handle.detach();
         await handle.aborted();
         session.dispose();
@@ -531,6 +539,23 @@ function sessionError(
 
 function interruptedAttempt(ticket: Ticket): TicketAttemptStop {
   return { kind: "stop", stop: { kind: "interrupted", ticket } };
+}
+
+/**
+ * Map an attempt to its frame settlement.
+ *
+ * `done` requires both a COMPLETE gate and a persisted status outside the
+ * runnable set, which is exactly what a successful attempt proves. Only a
+ * child-session error is `failed`; every deliberate stop is `stopped`.
+ */
+function frameStatus(
+  attempt: TicketAttempt | undefined,
+  cancelled: boolean,
+): SessionFrameStatus {
+  if (cancelled) return "stopped";
+  if (attempt === undefined) return "stopped";
+  if (attempt.kind === "success") return "done";
+  return attempt.stop.kind === "session-error" ? "failed" : "stopped";
 }
 
 function gitStop(ticket: Ticket, change: GitStateChange): RunStop {

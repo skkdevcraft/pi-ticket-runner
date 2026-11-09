@@ -3,13 +3,18 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import type {
+  CustomEntry,
+  EntryRenderer,
   ExtensionAPI,
   ExtensionCommandContext,
   SlashCommandInfo,
+  Theme,
 } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
 
 import { parseCommandArgs, registerTicketRunnerCommand } from "../src/command.ts";
 import { TicketRunnerError } from "../src/errors.ts";
+import { FRAME_ENTRY_TYPE, type SessionFrameSummary } from "../src/session-frame.ts";
 import type {
   OpenRepositoryGuardOptions,
   RepositoryGuard,
@@ -25,6 +30,7 @@ import {
   textDelta,
   ticketMarkdown,
   toolStart,
+  turnEnd,
   type TempTree,
 } from "./helpers.ts";
 
@@ -34,7 +40,7 @@ interface SentMessage {
 }
 
 interface UiCall {
-  readonly method: "setWidget" | "setStatus";
+  readonly method: "setStatus";
   readonly key: string;
   readonly value: unknown;
 }
@@ -44,9 +50,12 @@ interface FakePi {
   readonly notifications: Array<{ message: string; level: string }>;
   readonly uiCalls: UiCall[];
   readonly registered: { readonly name?: string; readonly description?: string | undefined };
+  readonly entries: CustomEntry[];
   run(args: string, cwd: string): Promise<void>;
   input(text: string, source?: "interactive" | "rpc" | "extension"): Promise<unknown>;
   shutdown(): void;
+  startSession(cwd?: string): Promise<void>;
+  renderEntry(entry: CustomEntry, expanded?: boolean): Component | undefined;
 }
 
 interface FakePiOptions {
@@ -54,6 +63,7 @@ interface FakePiOptions {
   readonly createSession?: (options: CreateTicketSessionOptions) => Promise<TicketSession>;
   readonly extensionPath?: string;
   readonly openGuard?: RepositoryGuardFactory;
+  readonly initialEntries?: readonly CustomEntry[];
 }
 
 function fakeRepositoryGuard(): RepositoryGuard {
@@ -79,28 +89,50 @@ function skillCommand(): SlashCommandInfo {
   };
 }
 
+const identityTheme = {
+  fg: (_colour: string, text: string) => text,
+} as unknown as Theme;
+
+function customEntry(id: string, customType: string, data: unknown): CustomEntry {
+  return {
+    type: "custom",
+    customType,
+    id,
+    parentId: null,
+    timestamp: "2025-01-01T00:00:00.000Z",
+    data,
+  };
+}
+
 function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
   const sent: SentMessage[] = [];
   const registered: { name?: string; description?: string | undefined } = {};
   let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
   const shutdownHandlers: Array<() => void> = [];
+  const sessionStartHandlers: Array<
+    (event: unknown, ctx: ExtensionCommandContext) => unknown
+  > = [];
   const inputHandlers: Array<
     (event: { type: "input"; text: string; source: string }, ctx: ExtensionCommandContext) => unknown
   > = [];
 
   const notifications: Array<{ message: string; level: string }> = [];
   const uiCalls: UiCall[] = [];
+  const entries: CustomEntry[] = [...(options.initialEntries ?? [])];
+  const entryRenderers = new Map<string, EntryRenderer>();
+  let entryCounter = options.initialEntries?.length ?? 0;
 
   const createContext = (cwd: string): ExtensionCommandContext => ({
     cwd,
+    model: { provider: "test", id: "gpt-5" },
     ui: {
       notify: (message: string, level: string) => notifications.push({ message, level }),
-      setWidget: (key: string, value: unknown) => {
-        uiCalls.push({ method: "setWidget", key, value });
-      },
       setStatus: (key: string, value: unknown) => {
         uiCalls.push({ method: "setStatus", key, value });
       },
+    },
+    sessionManager: {
+      getEntries: () => [...entries],
     },
   }) as unknown as ExtensionCommandContext;
 
@@ -110,12 +142,24 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
       registered.description = options.description;
       handler = options.handler;
     },
+    registerEntryRenderer: (customType: string, renderer: EntryRenderer) => {
+      entryRenderers.set(customType, renderer);
+    },
+    appendEntry: (customType: string, data?: unknown) => {
+      entryCounter += 1;
+      entries.push(customEntry(`entry-${entryCounter}`, customType, data));
+    },
     sendMessage: (message: Record<string, unknown>, options: unknown) => {
       sent.push({ message, options });
     },
     getCommands: () => [...(options.commands ?? [skillCommand()])],
     on: (event: string, listener: (...args: never[]) => void) => {
       if (event === "session_shutdown") shutdownHandlers.push(listener as () => void);
+      if (event === "session_start") {
+        sessionStartHandlers.push(
+          listener as (event: unknown, ctx: ExtensionCommandContext) => unknown,
+        );
+      }
       if (event === "input") {
         inputHandlers.push(
           listener as (event: { type: "input"; text: string; source: string }, ctx: ExtensionCommandContext) => unknown,
@@ -137,8 +181,13 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
     notifications,
     uiCalls,
     registered,
+    entries,
     shutdown() {
       for (const listener of shutdownHandlers) listener();
+    },
+    async startSession(cwd = "/project") {
+      const ctx = createContext(cwd);
+      for (const listener of sessionStartHandlers) await listener({ type: "session_start" }, ctx);
     },
     async input(text, source = "interactive") {
       const ctx = createContext("/project");
@@ -151,6 +200,11 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
     async run(args, cwd) {
       assert.ok(handler, "command handler was not registered");
       await handler(args, createContext(cwd));
+    },
+    renderEntry(entry, expanded = false) {
+      const renderer = entryRenderers.get(entry.customType);
+      if (!renderer) return undefined;
+      return renderer(entry, { expanded } as never, identityTheme);
     },
   };
 }
@@ -402,6 +456,12 @@ function resolveTicket(tree: TempTree, filename: string): void {
   tree.write(`issues/${filename}`, ticketMarkdown({ status: "Status: resolved" }));
 }
 
+function frameSummaries(pi: FakePi): SessionFrameSummary[] {
+  return pi.entries
+    .filter((entry) => entry.customType === FRAME_ENTRY_TYPE)
+    .map((entry) => entry.data as SessionFrameSummary);
+}
+
 describe("/ticket-runner start", () => {
   it("reports nothing to run without creating a session", async () => {
     const tree = createTempTree();
@@ -413,6 +473,7 @@ describe("/ticket-runner start", () => {
     await pi.run("start issues", tree.root);
 
     assert.equal(fake.created.length, 0);
+    assert.equal(pi.entries.length, 0);
     assert.equal(pi.sent.length, 1);
     assert.match(
       pi.sent[0]?.message.content as string,
@@ -432,6 +493,7 @@ describe("/ticket-runner start", () => {
     await pi.run("start issues", tree.root);
 
     assert.equal(fake.created.length, 0);
+    assert.equal(pi.entries.length, 0);
     assert.equal(pi.sent.length, 0);
     assert.equal(pi.notifications[0]?.level, "error");
     assert.match(pi.notifications[0]?.message ?? "", /skill:implement/);
@@ -523,6 +585,7 @@ describe("/ticket-runner start", () => {
     await pi.run("start issues", tree.root);
 
     assert.equal(fake.created.length, 0);
+    assert.equal(pi.entries.length, 0);
     assert.equal(pi.sent.length, 0);
     assert.equal(pi.notifications[0]?.level, "error");
     assert.match(pi.notifications[0]?.message ?? "", /01-first\.md has no Status: line/);
@@ -589,6 +652,7 @@ describe("/ticket-runner start", () => {
     await pi.run("start issues", tree.root);
 
     assert.equal(fake.created.length, 0);
+    assert.equal(pi.entries.length, 0);
     assert.equal(pi.sent.length, 0);
     assert.equal(pi.notifications[0]?.level, "error");
     assert.match(pi.notifications[0]?.message ?? "", /src\/app\.ts is dirty/);
@@ -745,17 +809,17 @@ describe("/ticket-runner stop", () => {
     assert.equal(fake.created[0]?.unsubscribed, 1);
     assert.equal(releases, 1);
     assert.equal(readFileSync(first, "utf8"), ticketMarkdown({ title: "# 01: First" }));
-    const widgetFrames = pi.uiCalls.filter((call) => call.method === "setWidget");
+    const statuses = pi.uiCalls.map((call) => call.value);
+    assert.ok(statuses.includes("🎫 2 left · 01-first"));
+    assert.equal(statuses.at(-1), "🎫 stopped · 2 left");
     assert.ok(
-      widgetFrames.some(
-        (call) => Array.isArray(call.value) && call.value.includes("▶ 01 First"),
-      ),
-      "the live widget must show the active ticket",
+      pi.entries.every((entry) => entry.customType === FRAME_ENTRY_TYPE),
+      "the editor widget must not be installed",
     );
-    assert.deepEqual(pi.uiCalls.slice(-2), [
-      { method: "setWidget", key: "ticket-runner", value: undefined },
-      { method: "setStatus", key: "ticket-runner", value: "🎫 stopped · 2 left" },
-    ]);
+    const frames = frameSummaries(pi);
+    assert.equal(frames.length, 2);
+    assert.equal(frames[0]?.status, "running");
+    assert.equal(frames[1]?.status, "stopped");
 
     const content = pi.sent[pi.sent.length - 1]?.message.content as string;
     assert.match(content, /^⏹ Execution interrupted at 01 First · 2 tickets left\./);
@@ -846,14 +910,9 @@ describe("main-session input while a run is active", () => {
   });
 });
 
-describe("live ticket-runner TUI", () => {
-  function configureImmediateRendering(tree: TempTree): void {
-    tree.write(".pi/ticket-runner.json", JSON.stringify({ liveFrameUpdateIntervalMs: 0 }));
-  }
-
-  it("renders the ticket, gate phase, next ticket, terminal footer, and clears the widget", async () => {
+describe("session frames and footer", () => {
+  it("appends one creation and one settlement summary per child session", async () => {
     const tree = createTempTree();
-    configureImmediateRendering(tree);
     tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
     tree.write("issues/02-second.md", ticketMarkdown({ title: "# 02: Second" }));
     const files = ["01-first.md", "02-second.md"];
@@ -869,6 +928,7 @@ describe("live ticket-runner TUI", () => {
         if (index === 0) {
           session.emit(textDelta("Writing src/repository.ts…"));
           session.emit(toolStart("edit"));
+          session.emit(turnEnd());
           return;
         }
         session.emit(textDelta("STATUS: COMPLETE\nREASON: all checks pass"));
@@ -881,43 +941,72 @@ describe("live ticket-runner TUI", () => {
 
     await pi.run("start issues", tree.root);
 
-    const widgetFrames = pi.uiCalls
-      .filter((call) => call.method === "setWidget")
-      .map((call) => call.value);
-    assert.ok(
-      widgetFrames.some((frame) => Array.isArray(frame) && frame.includes("▶ 01 First")),
+    const frames = frameSummaries(pi);
+    assert.equal(frames.length, 4);
+    assert.deepEqual(
+      frames.map((frame) => [frame.ticketId, frame.status]),
+      [
+        ["01", "running"],
+        ["01", "done"],
+        ["02", "running"],
+        ["02", "done"],
+      ],
     );
-    assert.ok(
-      widgetFrames.some(
-        (frame) => Array.isArray(frame) && frame.includes("🔎 01 verifying completion"),
-      ),
-    );
-    assert.ok(
-      widgetFrames.some(
-        (frame) => Array.isArray(frame) && frame.includes("⏳ next: 02-second"),
-      ),
-    );
-    assert.ok(
-      widgetFrames.some(
-        (frame) => Array.isArray(frame) && frame.includes("  Tool: edit — running"),
-      ),
-    );
+    for (const frame of frames) {
+      assert.equal(frame.childSessionFile !== undefined, true);
+      assert.equal(frame.model !== undefined, true);
+      assert.equal(frame.ticketTitle.length > 0, true);
+      assert.equal("text" in frame, false);
+      assert.equal("transcript" in frame, false);
+    }
+    assert.equal(frames[1]?.turns, 1);
+    assert.equal(frames[1]?.tools, 1);
+    assert.equal(frames[1]?.errors, 0);
 
-    const statuses = pi.uiCalls
-      .filter((call) => call.method === "setStatus")
-      .map((call) => call.value);
+    const statuses = pi.uiCalls.map((call) => call.value);
     assert.ok(statuses.includes("🎫 2 left · 01-first"));
     assert.ok(statuses.includes("🎫 1 left · 02-second"));
     assert.equal(statuses.at(-1), "🎫 done · 0 left");
-    assert.equal(widgetFrames.at(-1), undefined);
+    assert.ok(pi.uiCalls.every((call) => call.method === "setStatus"));
   });
 
-  it("clears the widget and footer when the extension shuts down", async () => {
+  it("renders the live creation entry, then the settlement entry after a reload", async () => {
     const tree = createTempTree();
-    configureImmediateRendering(tree);
+    tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
+    const fake = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      (_prompt, index) => {
+        if (index === 1) resolveTicket(tree, "01-first.md");
+      },
+    );
+    const pi = createFakePi(tree.path("agent"), { createSession: fake.create });
+
+    await pi.run("start issues", tree.root);
+
+    const [creation, settlement] = pi.entries;
+    assert.ok(creation);
+    assert.ok(settlement);
+    assert.ok(pi.renderEntry(creation));
+    assert.equal(pi.renderEntry(settlement), undefined);
+
+    const reloaded = createFakePi(tree.path("agent"), {
+      initialEntries: [...pi.entries],
+    });
+    await reloaded.startSession(tree.root);
+
+    assert.equal(reloaded.renderEntry(creation), undefined);
+    const rendered = reloaded.renderEntry(settlement);
+    assert.ok(rendered);
+    const lines = rendered.render(120);
+    assert.ok(lines.some((line) => /01 First · Done/.test(line)));
+  });
+
+  it("settles the active frame as stopped before shutdown and clears the footer", async () => {
+    const tree = createTempTree();
     tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
     let pi: FakePi;
     let callsAtShutdown: UiCall[] = [];
+    let entriesAtShutdown: CustomEntry[] = [];
     const fake = fakeSession(
       ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
       (_prompt, index) => {
@@ -927,20 +1016,42 @@ describe("live ticket-runner TUI", () => {
         }
         pi.shutdown();
         callsAtShutdown = [...pi.uiCalls];
+        entriesAtShutdown = [...pi.entries];
       },
     );
     pi = createFakePi(tree.path("agent"), { createSession: fake.create });
 
     await pi.run("start issues", tree.root);
 
-    assert.deepEqual(callsAtShutdown.slice(-2), [
-      { method: "setWidget", key: "ticket-runner", value: undefined },
+    assert.deepEqual(callsAtShutdown.slice(-1), [
       { method: "setStatus", key: "ticket-runner", value: undefined },
     ]);
-    assert.deepEqual(pi.uiCalls.slice(-2), [
-      { method: "setWidget", key: "ticket-runner", value: undefined },
-      { method: "setStatus", key: "ticket-runner", value: undefined },
-    ]);
+    const framesAtShutdown = entriesAtShutdown
+      .filter((entry) => entry.customType === FRAME_ENTRY_TYPE)
+      .map((entry) => entry.data as SessionFrameSummary);
+    assert.deepEqual(
+      framesAtShutdown.map((frame) => frame.status),
+      ["running", "stopped"],
+    );
+    assert.equal(pi.uiCalls.at(-1)?.value, undefined);
+  });
+
+  it("creates no frame when nothing runs or a preflight refusal stops the run", async () => {
+    const emptyTree = createTempTree();
+    emptyTree.write("issues/01-first.md", ticketMarkdown({ status: "Status: resolved" }));
+    const empty = createFakePi(emptyTree.path("agent"));
+    await empty.run("start issues", emptyTree.root);
+    assert.equal(empty.entries.length, 0);
+
+    const dirtyTree = createTempTree();
+    dirtyTree.write("issues/01-first.md", ticketMarkdown());
+    const refused = createFakePi(dirtyTree.path("agent"), {
+      openGuard: () => {
+        throw new TicketRunnerError("Refusing to start: src/app.ts is dirty");
+      },
+    });
+    await refused.run("start issues", dirtyTree.root);
+    assert.equal(refused.entries.length, 0);
   });
 });
 

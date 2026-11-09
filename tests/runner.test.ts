@@ -12,6 +12,7 @@ import {
   type RepositoryGuard,
 } from "../src/repository.ts";
 import { TicketRunState } from "../src/run-state.ts";
+import type { SessionFrameStatus } from "../src/session-frame.ts";
 import {
   hasImplementSkill,
   RunCancellation,
@@ -951,6 +952,240 @@ describe("runTickets: stop conditions", () => {
     );
     assert.equal(fake.sessions.length, 0);
     assert.equal(guard.released, 1);
+  });
+});
+
+describe("runTickets: session frame settlement", () => {
+  interface FrameRecorder {
+    readonly observer: {
+      ticketStarted(ticket: Ticket, remainingRunnable: number): void;
+      frameStarted(ticket: Ticket, child: { sessionFile: string | undefined; model: string | undefined }): void;
+      childEvent(): void;
+      gateStarted(ticket: Ticket): void;
+      frameSettled(status: SessionFrameStatus): void;
+      betweenTickets(next: Ticket | undefined, remainingRunnable: number): void;
+    };
+    readonly started: Array<{ ticketId: string; sessionFile: string | undefined; model: string | undefined }>;
+    readonly settled: SessionFrameStatus[];
+    readonly order: string[];
+  }
+
+  function frameRecorder(order: string[] = []): FrameRecorder {
+    const started: FrameRecorder["started"] = [];
+    const settled: SessionFrameStatus[] = [];
+    const observer = {
+      ticketStarted() {},
+      frameStarted(value: Ticket, child: { sessionFile: string | undefined; model: string | undefined }) {
+        started.push({ ticketId: value.id, sessionFile: child.sessionFile, model: child.model });
+        order.push("frame-start");
+      },
+      childEvent() {},
+      gateStarted() {
+        order.push("gate");
+      },
+      frameSettled(status: SessionFrameStatus) {
+        settled.push(status);
+        order.push(`settle:${status}`);
+      },
+      betweenTickets() {},
+    };
+    return { observer, started, settled, order };
+  }
+
+  it("settles done only after a COMPLETE gate and a persisted status change", async () => {
+    const order: string[] = [];
+    const statuses = new Map([["01-ticket-01.md", "ready-for-agent"]]);
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      order,
+      onPrompt: ({ promptIndex }) => {
+        if (promptIndex === 1) statuses.set("01-ticket-01.md", "resolved");
+      },
+    });
+    const frames = frameRecorder(order);
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent")),
+        createSession: async (sessionOptions) => {
+          order.push("create");
+          return fake.create(sessionOptions);
+        },
+        readStatus: statusReader(statuses),
+        observer: frames.observer,
+      }),
+    );
+
+    assert.equal(outcome.kind, "finished");
+    assert.deepEqual(frames.started, [
+      { ticketId: "01", sessionFile: "/sessions/1.jsonl", model: "model" },
+    ]);
+    assert.deepEqual(frames.settled, ["done"]);
+    assert.deepEqual(order, [
+      "create",
+      "frame-start",
+      "gate",
+      "unsubscribe",
+      "settle:done",
+      "dispose",
+    ]);
+  });
+
+  it("settles stopped for every deliberate stop", async () => {
+    const cases: Array<{
+      name: string;
+      responses: readonly string[];
+      readStatus?: () => string;
+      config?: RunTicketsOptions["config"];
+      onPrompt?: (context: { promptIndex: number; session: FakeSession }) => void;
+    }> = [
+      { name: "gate rejection", responses: ["implemented", "STATUS: INCOMPLETE\nREASON: no"] },
+      { name: "malformed gate", responses: ["implemented", "no status line"] },
+      { name: "unchanged status", responses: ["implemented", COMPLETE] },
+      {
+        name: "turn limit",
+        responses: ["implemented", COMPLETE],
+        config: { ...DEFAULT_CONFIG, maxTurnsPerTicket: 1 },
+        onPrompt: ({ promptIndex, session }) => {
+          if (promptIndex === 0) session.emit(turnEnd());
+        },
+      },
+    ];
+
+    for (const scenario of cases) {
+      const fake = fakeSessionFactory({
+        responses: scenario.responses,
+        ...(scenario.onPrompt ? { onPrompt: scenario.onPrompt } : {}),
+      });
+      const frames = frameRecorder();
+
+      await runTickets(
+        options({
+          inventory: inventory(ticket("01", "ready-for-agent")),
+          createSession: fake.create,
+          readStatus: scenario.readStatus ?? (() => "ready-for-agent"),
+          observer: frames.observer,
+          ...(scenario.config ? { config: scenario.config } : {}),
+        }),
+      );
+
+      assert.deepEqual(frames.settled, ["stopped"], scenario.name);
+      assert.equal(frames.started.length, 1, scenario.name);
+    }
+  });
+
+  it("settles stopped when the run is interrupted", async () => {
+    const cancellation = new RunCancellation();
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: async ({ promptIndex }) => {
+        if (promptIndex === 0) await cancellation.cancel();
+      },
+    });
+    const frames = frameRecorder();
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent")),
+        createSession: fake.create,
+        readStatus: (value) => value.status,
+        cancellation,
+        observer: frames.observer,
+      }),
+    );
+
+    assert.equal(outcome.kind, "stopped");
+    assert.deepEqual(frames.settled, ["stopped"]);
+  });
+
+  it("settles failed only for a child-session error", async () => {
+    for (const [phase, responses] of [
+      ["implementation", [new Error("child crashed")]],
+      ["completion-gate", ["implemented", new Error("gate crashed")]],
+    ] as const) {
+      const fake = fakeSessionFactory({ responses });
+      const frames = frameRecorder();
+
+      const outcome = await runTickets(
+        options({
+          inventory: inventory(ticket("01", "ready-for-agent")),
+          createSession: fake.create,
+          readStatus: (value) => value.status,
+          observer: frames.observer,
+        }),
+      );
+
+      assert.equal(outcome.kind === "stopped" ? outcome.stop.kind : undefined, "session-error");
+      assert.deepEqual(frames.settled, ["failed"], phase);
+    }
+  });
+
+  it("creates no frame for skipped tickets, Git stops, or session-creation failures", async () => {
+    const skipped = frameRecorder();
+    const nothing = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "resolved"), ticket("02", "ready-for-human")),
+        observer: skipped.observer,
+      }),
+    );
+    assert.equal(nothing.kind, "nothing-to-run");
+    assert.deepEqual(skipped.started, []);
+    assert.deepEqual(skipped.settled, []);
+
+    const gitStop = frameRecorder();
+    await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent")),
+        readStatus: (value) => value.status,
+        observer: gitStop.observer,
+        openGuard: () =>
+          fakeGuard([
+            {
+              expected: PROJECT_GIT,
+              actual: { root: "/project", branch: "feature", head: "def456" },
+              error: undefined,
+            },
+          ]),
+      }),
+    );
+    assert.deepEqual(gitStop.started, []);
+    assert.deepEqual(gitStop.settled, []);
+
+    const createFailure = frameRecorder();
+    await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent")),
+        createSession: async () => {
+          throw new Error("no session");
+        },
+        observer: createFailure.observer,
+      }),
+    );
+    assert.deepEqual(createFailure.started, []);
+    assert.deepEqual(createFailure.settled, []);
+  });
+
+  it("creates a frame only for the runnable ticket when earlier tickets are skipped", async () => {
+    const statuses = new Map([["01-ticket-01.md", "resolved"], ["02-ticket-02.md", "ready-for-agent"]]);
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: ({ promptIndex }) => {
+        if (promptIndex === 1) statuses.set("02-ticket-02.md", "resolved");
+      },
+    });
+    const frames = frameRecorder();
+
+    await runTickets(
+      options({
+        inventory: inventory(ticket("01", "resolved"), ticket("02", "ready-for-agent")),
+        createSession: fake.create,
+        readStatus: statusReader(statuses),
+        observer: frames.observer,
+      }),
+    );
+
+    assert.deepEqual(frames.started.map((frame) => frame.ticketId), ["02"]);
+    assert.deepEqual(frames.settled, ["done"]);
   });
 });
 

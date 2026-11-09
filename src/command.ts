@@ -10,10 +10,19 @@ import type {
 
 import { loadConfig } from "./config.ts";
 import { errorMessage, TicketRunnerError } from "./errors.ts";
-import { TicketLiveView } from "./live-view.ts";
+import { RunFooterView, type RunObserver } from "./live-view.ts";
 import type { RepositoryGuard, RepositoryGuardFactory } from "./repository.ts";
 import { TicketRunState } from "./run-state.ts";
 import { RunCancellation, runTickets, type RunOutcome } from "./runner.ts";
+import {
+  FRAME_ENTRY_TYPE,
+  type SessionFrameSummary,
+} from "./session-frame.ts";
+import {
+  findFrameEntryId,
+  SessionFrameController,
+  SessionFrameRegistry,
+} from "./session-frames.ts";
 import { createTicketSession, type TicketSessionFactory } from "./sessions.ts";
 import { loadTicketInventory } from "./tickets.ts";
 import {
@@ -132,7 +141,8 @@ interface RunHooks {
   onGuardChange(guard: RepositoryGuard | undefined): void;
   getCancellation(): RunCancellation | undefined;
   setCancellation(cancellation: RunCancellation | undefined): void;
-  setLiveView(view: TicketLiveView | undefined): void;
+  setFooter(footer: RunFooterView | undefined): void;
+  setFrames(frames: SessionFrameController | undefined): void;
 }
 
 /** Register `/ticket-runner` with Pi. */
@@ -141,19 +151,35 @@ export function registerTicketRunnerCommand(
   options: RegisterCommandOptions,
 ): void {
   const state = options.state ?? new TicketRunState();
+  const frameRegistry = new SessionFrameRegistry();
   let activeGuard: RepositoryGuard | undefined;
   let activeCancellation: RunCancellation | undefined;
-  let activeLiveView: TicketLiveView | undefined;
+  let activeFooter: RunFooterView | undefined;
+  let activeFrames: SessionFrameController | undefined;
 
-  // Quitting or reloading Pi must abort the child, clear the live TUI, and
-  // never leave a repository locked. The run's own cleanup releases the lock
-  // again (idempotently) once the abort settles.
+  // Reloading or resuming a session rebuilds which summary entry is current for
+  // every frame, so superseded summaries render nothing.
+  pi.on("session_start", (_event, ctx) => {
+    frameRegistry.rememberEntries(ctx.sessionManager.getEntries());
+  });
+
+  // Frames are durable TUI-only entries. Their renderer consults the live model
+  // while a child is active and the latest persisted summary after a reload.
+  pi.registerEntryRenderer<SessionFrameSummary>(
+    FRAME_ENTRY_TYPE,
+    (entry, { expanded }, theme) => frameRegistry.renderEntry(entry, expanded, theme),
+  );
+
+  // Quitting or reloading Pi must settle the active frame, abort the child,
+  // clear the footer, and never leave a repository locked. The run's own
+  // cleanup releases the lock again (idempotently) once the abort settles.
   pi.on("session_shutdown", () => {
+    activeFrames?.shutdown();
     activeGuard?.release();
     activeGuard = undefined;
     void activeCancellation?.cancel();
     activeCancellation = undefined;
-    activeLiveView?.clear();
+    activeFooter?.clear();
   });
 
   // The main session is otherwise idle while a child runs, so another agent
@@ -179,18 +205,29 @@ export function registerTicketRunnerCommand(
   pi.registerCommand(COMMAND_NAME, {
     description: "List and run local Markdown tickets, one fresh session per ticket",
     handler: async (args, ctx) => {
-      await runCommand(pi, options, state, args, ctx, {
-        onGuardChange: (guard) => {
-          activeGuard = guard;
+      await runCommand(
+        pi,
+        options,
+        state,
+        args,
+        ctx,
+        {
+          onGuardChange: (guard) => {
+            activeGuard = guard;
+          },
+          getCancellation: () => activeCancellation,
+          setCancellation: (cancellation) => {
+            activeCancellation = cancellation;
+          },
+          setFooter: (footer) => {
+            activeFooter = footer;
+          },
+          setFrames: (frames) => {
+            activeFrames = frames;
+          },
         },
-        getCancellation: () => activeCancellation,
-        setCancellation: (cancellation) => {
-          activeCancellation = cancellation;
-        },
-        setLiveView: (view) => {
-          activeLiveView = view;
-        },
-      });
+        frameRegistry,
+      );
     },
   });
 }
@@ -202,6 +239,7 @@ async function runCommand(
   args: string,
   ctx: ExtensionCommandContext,
   hooks: RunHooks,
+  frameRegistry: SessionFrameRegistry,
 ): Promise<void> {
   try {
     const command = parseCommandArgs(args);
@@ -210,7 +248,16 @@ async function runCommand(
         runList(pi, options, state, ctx, command.folder);
         return;
       case "start":
-        await runStart(pi, options, state, ctx, command.folder, command.allowDirty, hooks);
+        await runStart(
+          pi,
+          options,
+          state,
+          ctx,
+          command.folder,
+          command.allowDirty,
+          hooks,
+          frameRegistry,
+        );
         return;
       case "status":
         runStatus(pi, options, state, ctx);
@@ -255,6 +302,7 @@ async function runStart(
   folder: string,
   allowDirty: boolean,
   hooks: RunHooks,
+  frameRegistry: SessionFrameRegistry,
 ): Promise<void> {
   const { config, warnings } = loadConfig({ cwd: ctx.cwd, agentDir: options.agentDir });
   for (const warning of warnings) ctx.ui.notify(warning, "warning");
@@ -262,18 +310,47 @@ async function runStart(
   const inventory = loadTicketInventory({ cwd: ctx.cwd, folder });
   state.rememberFolder(folder);
 
-  const liveView = new TicketLiveView({
+  // The footer is the only run-level progress surface. There is deliberately
+  // no editor widget.
+  const footer = new RunFooterView({
     sink: {
-      setWidget: (lines) => {
-        ctx.ui.setWidget(COMMAND_NAME, lines === undefined ? undefined : [...lines]);
-      },
       setStatus: (text) => {
         ctx.ui.setStatus(COMMAND_NAME, text);
       },
     },
-    intervalMs: config.liveFrameUpdateIntervalMs,
   });
-  hooks.setLiveView(liveView);
+  hooks.setFooter(footer);
+
+  const frames = new SessionFrameController({
+    registry: frameRegistry,
+    append: (summary) => {
+      pi.appendEntry(FRAME_ENTRY_TYPE, summary);
+      return findFrameEntryId(ctx.sessionManager.getEntries(), summary.frameId);
+    },
+  });
+  hooks.setFrames(frames);
+
+  const observer: RunObserver = {
+    ticketStarted: (ticket, remainingRunnable) => {
+      footer.ticketStarted(ticket, remainingRunnable);
+    },
+    frameStarted: (ticket, child) => {
+      frames.start(ticket, child);
+    },
+    childEvent: (event) => {
+      frames.childEvent(event);
+    },
+    gateStarted: (ticket) => {
+      footer.gateStarted(ticket);
+      frames.gateStarted();
+    },
+    frameSettled: (status) => {
+      frames.settle(status);
+    },
+    betweenTickets: (next, remainingRunnable) => {
+      footer.betweenTickets(next, remainingRunnable);
+    },
+  };
 
   const cancellation = new RunCancellation();
   hooks.setCancellation(cancellation);
@@ -289,7 +366,7 @@ async function runStart(
       createSession: options.createSession ?? createTicketSession,
       getCommands: () => pi.getCommands(),
       state,
-      observer: liveView,
+      observer,
       allowDirty,
       cancellation,
       onGuardChange: hooks.onGuardChange,
@@ -308,11 +385,11 @@ async function runStart(
       ...(ctx.thinkingLevel === undefined ? {} : { thinkingLevel: ctx.thinkingLevel }),
     });
 
-    // The live view always clears when the run ends; the footer keeps a
-    // terminal summary until the next run or extension teardown.
-    if (outcome.kind === "stopped") liveView.stop(outcome.remainingRunnable);
-    else if (outcome.kind === "finished") liveView.finish(outcome.remainingRunnable);
-    else liveView.clear();
+    // The footer keeps a terminal summary until the next run or teardown;
+    // session frames stay in the transcript either way.
+    if (outcome.kind === "stopped") footer.stop(outcome.remainingRunnable);
+    else if (outcome.kind === "finished") footer.finish(outcome.remainingRunnable);
+    else footer.clear();
 
     pi.sendMessage(
       {
@@ -323,10 +400,15 @@ async function runStart(
       { triggerTurn: false },
     );
   } finally {
-    // A thrown failure still leaves a stopped footer; a shutdown clear wins
-    // because the live view ignores later updates once it is torn down.
-    if (outcome === undefined) liveView.stop();
+    // A thrown failure still leaves a stopped frame and footer. A shutdown
+    // clear wins because both views ignore later updates once torn down.
+    if (outcome === undefined) {
+      frames.settle("stopped");
+      footer.stop();
+    }
     if (hooks.getCancellation() === cancellation) hooks.setCancellation(undefined);
+    hooks.setFrames(undefined);
+    hooks.setFooter(undefined);
   }
 }
 
