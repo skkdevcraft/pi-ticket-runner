@@ -5,6 +5,7 @@ import type { Component } from "@earendil-works/pi-tui";
 
 import { DEFAULT_CONFIG } from "./config.ts";
 import { ThrottledRepaint, type RepaintClock } from "./live-view.ts";
+import { openSessionTranscript, type SessionTranscriptLoader } from "./session-transcript.ts";
 import type { ChildEvent } from "./sessions.ts";
 import type { TranscriptEntry } from "./transcript.ts";
 import {
@@ -45,6 +46,8 @@ export interface SessionFrameControllerOptions {
 /** Options for {@link SessionFrameRegistry}. */
 export interface SessionFrameRegistryOptions {
   readonly now?: (() => number) | undefined;
+  /** Open a settled frame's persisted child session file; injectable in tests. */
+  readonly openTranscript?: SessionTranscriptLoader | undefined;
 }
 
 /** Display caps stored on one live frame. */
@@ -215,15 +218,19 @@ export class LiveSessionFrame {
 export class SessionFrameRegistry {
   private readonly live = new Map<string, LiveSessionFrame>();
   private readonly latestEntry = new Map<string, string>();
+  private readonly transcriptCache = new Map<string, readonly TranscriptEntry[]>();
   private readonly now: () => number;
+  private readonly openTranscript: SessionTranscriptLoader;
 
   constructor(options: SessionFrameRegistryOptions = {}) {
     this.now = options.now ?? (() => Date.now());
+    this.openTranscript = options.openTranscript ?? openSessionTranscript;
   }
 
   /** Rebuild latest-entry knowledge from the entries of the current session. */
   rememberEntries(entries: readonly SessionEntry[]): void {
     this.latestEntry.clear();
+    this.transcriptCache.clear();
     for (const entry of entries) {
       const summary = frameEntrySummary(entry);
       if (summary !== undefined) this.latestEntry.set(summary.frameId, entry.id);
@@ -247,6 +254,11 @@ export class SessionFrameRegistry {
     this.live.clear();
   }
 
+  /** Drop settled transcripts so a later expand reloads from its session file. */
+  clearTranscriptCache(): void {
+    this.transcriptCache.clear();
+  }
+
   /** Render one persisted summary entry, or hide it as superseded. */
   renderEntry(entry: CustomEntry, expanded: boolean, theme: Theme): Component | undefined {
     const summary = readSessionFrameSummary(entry.data);
@@ -265,19 +277,41 @@ export class SessionFrameRegistry {
     const latest = this.latestEntry.get(summary.frameId);
     if (latest !== undefined) {
       if (latest !== entry.id) return undefined;
-      return new SessionFrameComponent(
-        summaryToFrameView(stoppedAfterReload(summary), expanded, this.now()),
-        theme,
-      );
+      return this.settledComponent(stoppedAfterReload(summary), expanded, theme);
     }
 
     // No scan has run yet. A terminal summary is the settled frame; a creation
     // summary only exists while its live model is available.
     if (!isTerminalFrameStatus(summary.status)) return undefined;
-    return new SessionFrameComponent(
-      summaryToFrameView(summary, expanded, this.now()),
-      theme,
-    );
+    return this.settledComponent(summary, expanded, theme);
+  }
+
+  private settledComponent(
+    summary: SessionFrameSummary,
+    expanded: boolean,
+    theme: Theme,
+  ): Component {
+    const view = summaryToFrameView(summary, expanded, this.now());
+
+    // The cache lives only while the frame is open. Collapsing drops it so the
+    // next expansion reopens the child session file.
+    if (!expanded) {
+      this.transcriptCache.delete(summary.frameId);
+      return new SessionFrameComponent(view, theme);
+    }
+
+    const cached = this.transcriptCache.get(summary.frameId);
+    if (cached !== undefined) {
+      return new SessionFrameComponent({ ...view, transcript: cached }, theme);
+    }
+
+    const loaded = this.openTranscript(summary.childSessionFile);
+    const transcript: readonly TranscriptEntry[] =
+      loaded.kind === "loaded"
+        ? loaded.entries
+        : [{ kind: "unavailable", reason: loaded.reason }];
+    this.transcriptCache.set(summary.frameId, transcript);
+    return new SessionFrameComponent({ ...view, transcript }, theme);
   }
 }
 
@@ -369,6 +403,12 @@ export class SessionFrameController {
   shutdown(): void {
     this.settle("stopped");
     this.registry.clearLive();
+    this.teardown();
+  }
+
+  /** Drop settled transcripts when the run that created them ends. */
+  teardown(): void {
+    this.registry.clearTranscriptCache();
   }
 
   private persist(frame: LiveSessionFrame): void {

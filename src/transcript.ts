@@ -7,6 +7,9 @@ export const TRUNCATION_FOOTER =
 /** Shown while the child session has produced no displayable messages yet. */
 export const EMPTY_TRANSCRIPT_TEXT = "Transcript not yet available.";
 
+/** Shown when a settled frame cannot read its child session file. */
+export const UNAVAILABLE_TRANSCRIPT_TEXT = "Transcript unavailable";
+
 /** One compact user turn: the skill invocation or the completion gate. */
 export interface TranscriptUserEntry {
   readonly kind: "user";
@@ -42,6 +45,12 @@ export interface TranscriptErrorEntry {
   readonly text: string;
 }
 
+/** A settled frame whose persisted child session could not be opened. */
+export interface TranscriptUnavailableEntry {
+  readonly kind: "unavailable";
+  readonly reason: string;
+}
+
 /**
  * A read-only projection of one child message.
  *
@@ -52,7 +61,8 @@ export type TranscriptEntry =
   | TranscriptUserEntry
   | TranscriptAssistantEntry
   | TranscriptToolEntry
-  | TranscriptErrorEntry;
+  | TranscriptErrorEntry
+  | TranscriptUnavailableEntry;
 
 /** How one projected entry is painted. */
 export type TranscriptTone = "dim" | "error";
@@ -237,6 +247,8 @@ function renderEntry(entry: TranscriptEntry, options: TranscriptRenderOptions): 
       }));
     case "error":
       return [{ text: `Error: ${entry.text}`, tone: "error" }];
+    case "unavailable":
+      return [{ text: `${UNAVAILABLE_TRANSCRIPT_TEXT} · ${entry.reason}`, tone: "error" }];
     case "tool":
       return renderTool(entry, options);
   }

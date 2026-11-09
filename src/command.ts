@@ -413,6 +413,7 @@ async function runStart(
       frames.settle("stopped");
       footer.stop();
     }
+    frames.teardown();
     if (hooks.getCancellation() === cancellation) hooks.setCancellation(undefined);
     hooks.setFrames(undefined);
     hooks.setFooter(undefined);
