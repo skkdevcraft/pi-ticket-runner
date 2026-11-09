@@ -6,6 +6,15 @@
     "pi-package"
   ],
   "license": "MIT",
+  "author": "Stoyan Krastev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/skkdevcraft/pi-ticket-runner.git"
+  },
+  "homepage": "https://github.com/skkdevcraft/pi-ticket-runner#readme",
+  "bugs": {
+    "url": "https://github.com/skkdevcraft/pi-ticket-runner/issues"
+  },
   "type": "module",
   "pi": {
     "extensions": [
