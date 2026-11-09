@@ -5,6 +5,12 @@ import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { TicketRunnerError } from "../src/errors.ts";
+import {
+  type GitState,
+  type GitStateChange,
+  type OpenRepositoryGuardOptions,
+  type RepositoryGuard,
+} from "../src/repository.ts";
 import { TicketRunState } from "../src/run-state.ts";
 import {
   hasImplementSkill,
@@ -151,7 +157,40 @@ function options(
     createSession: fakeSessionFactory().create,
     getCommands: () => [skillCommand()],
     readStatus: (value) => value.status,
+    openGuard: () => fakeGuard(),
     ...overrides,
+  };
+}
+
+interface FakeGuard extends RepositoryGuard {
+  released: number;
+  checks: number;
+  changes: Array<GitStateChange | undefined>;
+  accepted: number;
+  accepts: Array<GitStateChange | undefined>;
+}
+
+const PROJECT_GIT: GitState = { root: "/project", branch: "main", head: "abc123" };
+
+function fakeGuard(changes: Array<GitStateChange | undefined> = []): FakeGuard {
+  return {
+    git: PROJECT_GIT,
+    released: 0,
+    checks: 0,
+    changes: [...changes],
+    accepted: 0,
+    accepts: [],
+    checkUnchanged() {
+      this.checks += 1;
+      return this.changes.shift();
+    },
+    acceptHead() {
+      this.accepted += 1;
+      return this.accepts.shift();
+    },
+    release() {
+      this.released += 1;
+    },
   };
 }
 
@@ -387,6 +426,46 @@ describe("runTickets: sequential execution", () => {
     assert.equal(fake.sessions.length, 0);
   });
 
+  it("acquires the repository guard before the first session and releases it after finishing", async () => {
+    const statuses = new Map([["01-ticket-01.md", "ready-for-agent"]]);
+    const guard = fakeGuard();
+    const observed: OpenRepositoryGuardOptions[] = [];
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: ({ promptIndex }) => {
+        if (promptIndex === 1) statuses.set("01-ticket-01.md", "resolved");
+      },
+    });
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent")),
+        createSession: fake.create,
+        readStatus: statusReader(statuses),
+        allowDirty: true,
+        openGuard: (guardOptions) => {
+          observed.push(guardOptions);
+          return guard;
+        },
+      }),
+    );
+
+    assert.equal(outcome.kind, "finished");
+    assert.deepEqual(observed, [
+      {
+        cwd: "/project",
+        ticketFolder: "issues",
+        ticketFolderPath: "/project/issues",
+        allowDirty: true,
+        staleLockHours: 12,
+      },
+    ]);
+    assert.equal(fake.sessions.length, 1);
+    assert.equal(guard.checks, 1);
+    assert.equal(guard.accepted, 1);
+    assert.equal(guard.released, 1);
+  });
+
   it("tracks the active ticket and session for status reporting", async () => {
     const statuses = new Map([["01-ticket-01.md", "ready-for-agent"]]);
     const state = new TicketRunState();
@@ -418,6 +497,64 @@ describe("runTickets: sequential execution", () => {
     assert.deepEqual(observations[0], { current: "01", session: "/sessions/1.jsonl" });
     assert.equal(state.active, undefined);
     assert.equal(state.lastFolder, "issues");
+  });
+
+  it("does not acquire the lock when nothing is runnable", async () => {
+    let opened = 0;
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "resolved")),
+        openGuard: () => {
+          opened += 1;
+          return fakeGuard();
+        },
+      }),
+    );
+
+    assert.deepEqual(outcome, { kind: "nothing-to-run" });
+    assert.equal(opened, 0);
+  });
+
+  it("releases the lock when an unexpected error escapes the run", async () => {
+    const guard = fakeGuard();
+    let reads = 0;
+
+    await assert.rejects(
+      runTickets(
+        options({
+          inventory: inventory(ticket("01", "ready-for-agent")),
+          readStatus: (value) => {
+            reads += 1;
+            if (reads > 1) throw new Error("ticket disk disappeared");
+            return value.status;
+          },
+          openGuard: () => guard,
+        }),
+      ),
+      /ticket disk disappeared/,
+    );
+
+    assert.equal(guard.released, 1);
+  });
+
+  it("refuses the run before any session when preflight throws", async () => {
+    const fake = fakeSessionFactory();
+
+    await assert.rejects(
+      runTickets(
+        options({
+          inventory: inventory(ticket("01", "ready-for-agent")),
+          createSession: fake.create,
+          openGuard: () => {
+            throw new TicketRunnerError("Refusing to start: dirty tree");
+          },
+        }),
+      ),
+      /dirty tree/,
+    );
+
+    assert.equal(fake.sessions.length, 0);
   });
 });
 
@@ -587,12 +724,14 @@ describe("runTickets: stop conditions", () => {
   });
 
   it("stops when the child session cannot be created", async () => {
+    const guard = fakeGuard();
     const outcome = await runTickets(
       options({
         inventory: inventory(ticket("01", "ready-for-agent")),
         createSession: async () => {
           throw new Error("no session");
         },
+        openGuard: () => guard,
       }),
     );
 
@@ -604,6 +743,136 @@ describe("runTickets: stop conditions", () => {
       "create",
     );
     assert.equal(outcome.kind === "stopped" ? outcome.remainingRunnable : -1, 1);
+    assert.equal(guard.released, 1);
+  });
+
+  it("releases the lock when a ticket stops the run", async () => {
+    const guard = fakeGuard();
+    const fake = fakeSessionFactory({
+      responses: ["implemented", "STATUS: BLOCKED\nREASON: needs credentials"],
+    });
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent")),
+        createSession: fake.create,
+        openGuard: () => guard,
+      }),
+    );
+
+    assert.equal(outcome.kind, "stopped");
+    assert.equal(guard.released, 1);
+  });
+
+  it("stops before the next session when branch or HEAD changes", async () => {
+    const statuses = new Map([
+      ["01-ticket-01.md", "ready-for-agent"],
+      ["02-ticket-02.md", "ready-for-agent"],
+    ]);
+    const changed: GitStateChange = {
+      expected: PROJECT_GIT,
+      actual: { root: "/project", branch: "feature", head: "def456" },
+      error: undefined,
+    };
+    const guard = fakeGuard([undefined, changed]);
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: ({ promptIndex }) => {
+        if (promptIndex === 1) statuses.set("01-ticket-01.md", "resolved");
+      },
+    });
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent"), ticket("02", "ready-for-agent")),
+        createSession: fake.create,
+        readStatus: statusReader(statuses),
+        openGuard: () => guard,
+      }),
+    );
+
+    assert.equal(outcome.kind, "stopped");
+    if (outcome.kind !== "stopped") return;
+    assert.equal(outcome.stop.kind, "git-changed");
+    assert.equal(outcome.stop.kind === "git-changed" ? outcome.stop.ticket.id : undefined, "02");
+    assert.equal(
+      outcome.stop.kind === "git-changed" ? outcome.stop.actual?.branch : undefined,
+      "feature",
+    );
+    assert.equal(fake.sessions.length, 1);
+    assert.equal(guard.checks, 2);
+    assert.equal(guard.released, 1);
+    assert.equal(outcome.remainingRunnable, 1);
+  });
+
+  it("stops when the child's reported git advance leaves the branch", async () => {
+    const statuses = new Map([
+      ["01-ticket-01.md", "ready-for-agent"],
+      ["02-ticket-02.md", "ready-for-agent"],
+    ]);
+    const changed: GitStateChange = {
+      expected: PROJECT_GIT,
+      actual: { root: "/project", branch: "other", head: "def456" },
+      error: undefined,
+    };
+    const guard = fakeGuard();
+    guard.accepts.push(changed);
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: ({ promptIndex }) => {
+        if (promptIndex === 1) statuses.set("01-ticket-01.md", "resolved");
+      },
+    });
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent"), ticket("02", "ready-for-agent")),
+        createSession: fake.create,
+        readStatus: statusReader(statuses),
+        openGuard: () => guard,
+      }),
+    );
+
+    assert.equal(outcome.kind, "stopped");
+    assert.equal(outcome.kind === "stopped" ? outcome.stop.kind : undefined, "git-changed");
+    assert.equal(
+      outcome.kind === "stopped" && outcome.stop.kind === "git-changed"
+        ? outcome.stop.ticket.id
+        : undefined,
+      "01",
+    );
+    assert.deepEqual(outcome.kind === "stopped" ? ranIds(outcome.ran) : [], ["01"]);
+    assert.equal(fake.sessions.length, 1);
+    assert.equal(guard.released, 1);
+  });
+
+  it("stops before a session when the git state cannot be checked", async () => {
+    const guard = fakeGuard([
+      { expected: PROJECT_GIT, actual: undefined, error: "git is unavailable" },
+    ]);
+    const fake = fakeSessionFactory({ responses: ["implemented", COMPLETE] });
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent")),
+        createSession: fake.create,
+        openGuard: () => guard,
+      }),
+    );
+
+    assert.equal(outcome.kind, "stopped");
+    assert.equal(
+      outcome.kind === "stopped" ? outcome.stop.kind : undefined,
+      "git-check-error",
+    );
+    assert.equal(
+      outcome.kind === "stopped" && outcome.stop.kind === "git-check-error"
+        ? outcome.stop.message
+        : undefined,
+      "git is unavailable",
+    );
+    assert.equal(fake.sessions.length, 0);
+    assert.equal(guard.released, 1);
   });
 });
 

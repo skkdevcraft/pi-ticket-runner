@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -32,6 +33,29 @@ export function createTempTree(): TempTree {
       return join(root, relativePath);
     },
   };
+}
+
+/** Run a Git command in a directory and return its stdout. */
+export function git(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+/** Initialise a Git repository with a deterministic local identity. */
+export function initGitRepo(root: string, branch = "main"): void {
+  git(root, "init", "-q");
+  git(root, "symbolic-ref", "HEAD", `refs/heads/${branch}`);
+  git(root, "config", "user.email", "ticket-runner@example.com");
+  git(root, "config", "user.name", "Ticket Runner Tests");
+}
+
+/** Stage and commit everything in a repository. */
+export function commitAll(root: string, message = "initial"): void {
+  git(root, "add", "-A");
+  git(root, "commit", "-qm", message);
 }
 
 /** Mark a path unreadable for the current process. */

@@ -144,7 +144,28 @@ function renderStop(stop: RunStop, remainingRunnable: number): string {
         stop.message,
         stopped,
       ].join("\n");
+    case "git-changed": {
+      const actual = stop.actual
+        ? `${stop.actual.branch} at ${shortHead(stop.actual.head)}`
+        : "an unreadable Git state";
+      return [
+        `⏹ Repository branch or HEAD changed before ${stop.ticket.id} ${stop.ticket.title}.`,
+        `Expected ${stop.expected.branch} at ${shortHead(stop.expected.head)}, found ${actual}.`,
+        "The runner never switches branches, stashes, or discards work.",
+        stopped,
+      ].join("\n");
+    }
+    case "git-check-error":
+      return [
+        `⏹ Cannot verify the repository branch and HEAD before ${stop.ticket.id} ${stop.ticket.title}.`,
+        stop.message,
+        stopped,
+      ].join("\n");
   }
+}
+
+function shortHead(head: string): string {
+  return head.length > 8 ? head.slice(0, 8) : head || "unknown";
 }
 
 function phaseLabel(phase: "create" | "implementation" | "completion-gate"): string {

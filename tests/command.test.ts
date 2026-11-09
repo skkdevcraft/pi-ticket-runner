@@ -11,6 +11,11 @@ import type {
 import { parseCommandArgs, registerTicketRunnerCommand } from "../src/command.ts";
 import { TicketRunnerError } from "../src/errors.ts";
 import type {
+  OpenRepositoryGuardOptions,
+  RepositoryGuard,
+  RepositoryGuardFactory,
+} from "../src/repository.ts";
+import type {
   ChildEvent,
   CreateTicketSessionOptions,
   TicketSession,
@@ -27,12 +32,23 @@ interface FakePi {
   readonly notifications: Array<{ message: string; level: string }>;
   readonly registered: { readonly name?: string; readonly description?: string | undefined };
   run(args: string, cwd: string): Promise<void>;
+  shutdown(): void;
 }
 
 interface FakePiOptions {
   readonly commands?: readonly SlashCommandInfo[];
   readonly createSession?: (options: CreateTicketSessionOptions) => Promise<TicketSession>;
   readonly extensionPath?: string;
+  readonly openGuard?: RepositoryGuardFactory;
+}
+
+function fakeRepositoryGuard(): RepositoryGuard {
+  return {
+    git: { root: "/repo", branch: "main", head: "abc123" },
+    checkUnchanged: () => undefined,
+    acceptHead: () => undefined,
+    release: () => {},
+  };
 }
 
 function skillCommand(): SlashCommandInfo {
@@ -53,6 +69,7 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
   const sent: SentMessage[] = [];
   const registered: { name?: string; description?: string | undefined } = {};
   let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+  const shutdownHandlers: Array<() => void> = [];
 
   const pi = {
     registerCommand: (name: string, options: { description?: string; handler: typeof handler }) => {
@@ -64,6 +81,10 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
       sent.push({ message, options });
     },
     getCommands: () => [...(options.commands ?? [skillCommand()])],
+    on: (event: string, listener: () => void) => {
+      if (event === "session_shutdown") shutdownHandlers.push(listener);
+      return () => {};
+    },
   } as unknown as ExtensionAPI;
 
   const notifications: Array<{ message: string; level: string }> = [];
@@ -72,12 +93,16 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
     agentDir,
     extensionPath: options.extensionPath ?? "/repo/index.ts",
     ...(options.createSession ? { createSession: options.createSession } : {}),
+    openGuard: options.openGuard ?? fakeRepositoryGuard,
   });
 
   return {
     sent,
     notifications,
     registered,
+    shutdown() {
+      for (const listener of shutdownHandlers) listener();
+    },
     async run(args, cwd) {
       assert.ok(handler, "command handler was not registered");
       const ctx = {
@@ -463,6 +488,92 @@ describe("/ticket-runner start", () => {
     assert.equal(fake.created[0]?.disposed, 1);
     assert.match(pi.sent[0]?.message.content as string, /is incomplete/);
     assert.match(pi.sent[0]?.message.content as string, /tests fail/);
+  });
+
+  it("passes the folder and --allow-dirty policy to preflight", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown());
+    const fake = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      (_prompt, index) => {
+        if (index === 1) resolveTicket(tree, "01-first.md");
+      },
+    );
+    const observed: OpenRepositoryGuardOptions[] = [];
+    const pi = createFakePi(tree.path("agent"), {
+      createSession: fake.create,
+      openGuard: (guardOptions) => {
+        observed.push(guardOptions);
+        return fakeRepositoryGuard();
+      },
+    });
+
+    await pi.run("start issues --allow-dirty", tree.root);
+
+    assert.deepEqual(observed, [
+      {
+        cwd: tree.root,
+        ticketFolder: "issues",
+        ticketFolderPath: tree.path("issues"),
+        allowDirty: true,
+        staleLockHours: 12,
+      },
+    ]);
+  });
+
+  it("reports a preflight refusal without creating a session", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown());
+    const fake = fakeSession(["unused"]);
+    const pi = createFakePi(tree.path("agent"), {
+      createSession: fake.create,
+      openGuard: () => {
+        throw new TicketRunnerError("Refusing to start: src/app.ts is dirty");
+      },
+    });
+
+    await pi.run("start issues", tree.root);
+
+    assert.equal(fake.created.length, 0);
+    assert.equal(pi.sent.length, 0);
+    assert.equal(pi.notifications[0]?.level, "error");
+    assert.match(pi.notifications[0]?.message ?? "", /src\/app\.ts is dirty/);
+  });
+
+  it("releases the repository lock on extension shutdown", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown());
+    let releases = 0;
+    let releasesDuringPrompt = 0;
+    let pi: FakePi;
+    const guard: RepositoryGuard = {
+      git: { root: tree.root, branch: "main", head: "abc123" },
+      checkUnchanged: () => undefined,
+      acceptHead: () => undefined,
+      release: () => {
+        releases += 1;
+      },
+    };
+    const fake = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      (_prompt, index) => {
+        if (index === 0) {
+          pi.shutdown();
+          releasesDuringPrompt = releases;
+          return;
+        }
+        resolveTicket(tree, "01-first.md");
+      },
+    );
+    pi = createFakePi(tree.path("agent"), {
+      createSession: fake.create,
+      openGuard: () => guard,
+    });
+
+    await pi.run("start issues", tree.root);
+
+    assert.equal(releasesDuringPrompt, 1);
+    assert.ok(releases >= 1);
   });
 });
 

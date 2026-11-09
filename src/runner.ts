@@ -9,6 +9,13 @@ import {
   type GateStatus,
 } from "./gate.ts";
 import type { TicketRunState } from "./run-state.ts";
+import {
+  openRepositoryGuard,
+  type GitState,
+  type GitStateChange,
+  type RepositoryGuard,
+  type RepositoryGuardFactory,
+} from "./repository.ts";
 import type {
   CreateTicketSessionOptions,
   TicketSession,
@@ -65,6 +72,17 @@ export type RunStop =
       readonly ticket: Ticket;
       readonly phase: "create" | "implementation" | "completion-gate";
       readonly message: string;
+    }
+  | {
+      readonly kind: "git-changed";
+      readonly ticket: Ticket;
+      readonly expected: GitState;
+      readonly actual: GitState | undefined;
+    }
+  | {
+      readonly kind: "git-check-error";
+      readonly ticket: Ticket;
+      readonly message: string;
     };
 
 /** The final result of one `/ticket-runner start` invocation. */
@@ -115,6 +133,12 @@ export interface RunTicketsOptions {
   readonly readStatus?: ((ticket: Ticket) => string) | undefined;
   /** Repository's completed status value, named in the gate prompt. */
   readonly completedStatus?: string | undefined;
+  /** Suppress only the pre-existing-unrelated-changes refusal. */
+  readonly allowDirty?: boolean | undefined;
+  /** Repository guard factory, injectable so preflight can be tested without Git. */
+  readonly openGuard?: RepositoryGuardFactory | undefined;
+  /** Receives the held guard and is cleared when it is released. */
+  readonly onGuardChange?: ((guard: RepositoryGuard | undefined) => void) | undefined;
   /** Called after each ticket persists a non-runnable status. */
   readonly onProgress?: ((progress: TicketProgress) => void) | undefined;
   /** In-memory state observable by `/ticket-runner status`. */
@@ -157,7 +181,22 @@ export async function runTickets(options: RunTicketsOptions): Promise<RunOutcome
 
   options.state?.begin(options.inventory.folderLabel, options.inventory.tickets.length, initialRunnable);
 
+  let guard: RepositoryGuard;
   try {
+    guard = (options.openGuard ?? openRepositoryGuard)({
+      cwd: options.cwd,
+      ticketFolder: options.inventory.folderLabel,
+      ticketFolderPath: options.inventory.folderPath,
+      allowDirty: options.allowDirty ?? false,
+      staleLockHours: options.config.staleLockHours,
+    });
+  } catch (error) {
+    options.state?.end();
+    throw error;
+  }
+
+  try {
+    options.onGuardChange?.(guard);
     for (const ticket of options.inventory.tickets) {
       // Statuses are read from disk before every ticket, never from run state.
       statuses = readAllStatuses(options.inventory, readStatus);
@@ -165,6 +204,13 @@ export async function runTickets(options: RunTicketsOptions): Promise<RunOutcome
       if (!isRunnableStatus(status, runnableStatuses)) {
         skipped.push({ ticket, status });
         continue;
+      }
+
+      // A branch or HEAD change means another process shared this worktree;
+      // stop before creating the next session.
+      const change = guard.checkUnchanged();
+      if (change !== undefined) {
+        return stopped(options, readStatus, ran, skipped, gitStop(ticket, change));
       }
 
       const remainingRunnable = countRunnable(statuses, runnableStatuses);
@@ -210,6 +256,14 @@ export async function runTickets(options: RunTicketsOptions): Promise<RunOutcome
       }
 
       ran.push({ ticket, status: attempt.status });
+
+      // The child commits its ticket, so record the new HEAD as the baseline
+      // for the next check; a branch switch is still a genuine change.
+      const accepted = guard.acceptHead();
+      if (accepted !== undefined) {
+        return stopped(options, readStatus, ran, skipped, gitStop(ticket, accepted));
+      }
+
       statuses = readAllStatuses(options.inventory, readStatus);
       const next = firstRunnable(options.inventory.tickets, statuses, runnableStatuses);
       const remaining = countRunnable(statuses, runnableStatuses);
@@ -230,6 +284,8 @@ export async function runTickets(options: RunTicketsOptions): Promise<RunOutcome
       remainingRunnable: countRunnable(statuses, runnableStatuses),
     };
   } finally {
+    guard.release();
+    options.onGuardChange?.(undefined);
     options.state?.end();
   }
 }
@@ -341,6 +397,18 @@ function sessionError(
   return {
     kind: "stop",
     stop: { kind: "session-error", ticket, phase, message: errorMessage(error) },
+  };
+}
+
+function gitStop(ticket: Ticket, change: GitStateChange): RunStop {
+  if (change.error !== undefined) {
+    return { kind: "git-check-error", ticket, message: change.error };
+  }
+  return {
+    kind: "git-changed",
+    ticket,
+    expected: change.expected,
+    actual: change.actual,
   };
 }
 

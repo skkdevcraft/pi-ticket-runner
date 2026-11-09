@@ -4,6 +4,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 
 import { loadConfig } from "./config.ts";
 import { errorMessage, TicketRunnerError } from "./errors.ts";
+import type { RepositoryGuard, RepositoryGuardFactory } from "./repository.ts";
 import { TicketRunState } from "./run-state.ts";
 import { runTickets } from "./runner.ts";
 import { createTicketSession, type TicketSessionFactory } from "./sessions.ts";
@@ -41,6 +42,8 @@ export interface RegisterCommandOptions {
   readonly createSession?: TicketSessionFactory;
   /** In-memory run state, injectable so status behaviour can be tested. */
   readonly state?: TicketRunState;
+  /** Repository guard factory, injectable so start can be tested without Git. */
+  readonly openGuard?: RepositoryGuardFactory;
 }
 
 /**
@@ -123,11 +126,20 @@ export function registerTicketRunnerCommand(
   options: RegisterCommandOptions,
 ): void {
   const state = options.state ?? new TicketRunState();
+  let activeGuard: RepositoryGuard | undefined;
+
+  // Quitting or reloading Pi must never leave a repository locked.
+  pi.on("session_shutdown", () => {
+    activeGuard?.release();
+    activeGuard = undefined;
+  });
 
   pi.registerCommand(COMMAND_NAME, {
     description: "List and run local Markdown tickets, one fresh session per ticket",
     handler: async (args, ctx) => {
-      await runCommand(pi, options, state, args, ctx);
+      await runCommand(pi, options, state, args, ctx, (guard) => {
+        activeGuard = guard;
+      });
     },
   });
 }
@@ -138,6 +150,7 @@ async function runCommand(
   state: TicketRunState,
   args: string,
   ctx: ExtensionCommandContext,
+  onGuardChange: (guard: RepositoryGuard | undefined) => void,
 ): Promise<void> {
   try {
     const command = parseCommandArgs(args);
@@ -146,7 +159,7 @@ async function runCommand(
         runList(pi, options, state, ctx, command.folder);
         return;
       case "start":
-        await runStart(pi, options, state, ctx, command.folder);
+        await runStart(pi, options, state, ctx, command.folder, command.allowDirty, onGuardChange);
         return;
       case "status":
         runStatus(pi, options, state, ctx);
@@ -192,6 +205,8 @@ async function runStart(
   state: TicketRunState,
   ctx: ExtensionCommandContext,
   folder: string,
+  allowDirty: boolean,
+  onGuardChange: (guard: RepositoryGuard | undefined) => void,
 ): Promise<void> {
   const { config, warnings } = loadConfig({ cwd: ctx.cwd, agentDir: options.agentDir });
   for (const warning of warnings) ctx.ui.notify(warning, "warning");
@@ -207,6 +222,9 @@ async function runStart(
     createSession: options.createSession ?? createTicketSession,
     getCommands: () => pi.getCommands(),
     state,
+    allowDirty,
+    onGuardChange,
+    ...(options.openGuard === undefined ? {} : { openGuard: options.openGuard }),
     onProgress: (progress) => {
       pi.sendMessage(
         {

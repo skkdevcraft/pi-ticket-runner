@@ -376,4 +376,46 @@ describe("renderRunOutcome", () => {
     assert.match(output, /gate crashed/);
     assert.match(output, /Execution stopped · 1 ticket left\./);
   });
+
+  it("reports a branch or HEAD change before the next ticket", () => {
+    const expected = { root: "/project", branch: "main", head: "aaaaaaaa1111" };
+    const outcome: RunOutcome = {
+      kind: "stopped",
+      ran: [],
+      skipped: [],
+      stop: {
+        kind: "git-changed",
+        ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+        expected,
+        actual: { root: "/project", branch: "feature", head: "bbbbbbbb2222" },
+      },
+      remainingRunnable: 2,
+    };
+
+    const output = renderRunOutcome(outcome, ".scratch/auth/issues", runnable);
+
+    assert.match(output, /^⏹ Repository branch or HEAD changed before 03 Repository Layer\./);
+    assert.match(output, /Expected main at aaaaaaaa, found feature at bbbbbbbb\./);
+    assert.match(output, /Execution stopped · 2 tickets left\./);
+  });
+
+  it("reports an unreadable git state before a ticket", () => {
+    const outcome: RunOutcome = {
+      kind: "stopped",
+      ran: [],
+      skipped: [],
+      stop: {
+        kind: "git-check-error",
+        ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+        message: "git is unavailable",
+      },
+      remainingRunnable: 1,
+    };
+
+    const output = renderRunOutcome(outcome, ".scratch/auth/issues", runnable);
+
+    assert.match(output, /^⏹ Cannot verify the repository branch and HEAD before 03 Repository Layer\./);
+    assert.match(output, /git is unavailable/);
+    assert.match(output, /Execution stopped · 1 ticket left\./);
+  });
 });
