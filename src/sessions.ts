@@ -22,6 +22,8 @@ export type ChildEvent = AgentSessionEvent;
  * session.
  */
 export interface TicketSession {
+  /** Path of the persisted session file, when the session is persistent. */
+  readonly sessionFile: string | undefined;
   prompt(text: string): Promise<void>;
   abort(): Promise<void>;
   subscribe(listener: (event: ChildEvent) => void): () => void;
@@ -103,6 +105,10 @@ class SdkTicketSession implements TicketSession {
 
   constructor(session: AgentSession) {
     this.session = session;
+  }
+
+  get sessionFile(): string | undefined {
+    return this.session.sessionFile;
   }
 
   prompt(text: string): Promise<void> {

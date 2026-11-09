@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import type { ActiveRun } from "../src/run-state.ts";
+import type { RunOutcome, TicketProgress } from "../src/runner.ts";
 import type { Ticket, TicketInventory } from "../src/tickets.ts";
-import type { StartOutcome } from "../src/runner.ts";
-import { renderStartOutcome, renderTicketList } from "../src/ui.ts";
+import {
+  renderActiveRun,
+  renderRunOutcome,
+  renderTicketList,
+  renderTicketProgress,
+} from "../src/ui.ts";
 
 const RUNNABLE = ["ready-for-agent"];
 
@@ -135,12 +141,76 @@ describe("renderTicketList", () => {
   });
 });
 
+describe("renderTicketProgress", () => {
+  it("reports the persisted status, next ticket, and remaining count", () => {
+    const progress: TicketProgress = {
+      ticket: ticket("03", "repository-layer", "resolved", "Repository Layer"),
+      status: "resolved",
+      next: ticket("05", "documentation", "ready-for-agent", "Documentation"),
+      remainingRunnable: 1,
+    };
 
-describe("renderStartOutcome", () => {
+    assert.deepEqual(lines(renderTicketProgress(progress)), [
+      "✅ 03 Repository Layer — status now `resolved`.",
+      "Next: 05 Documentation (1 ticket left).",
+    ]);
+  });
+
+  it("reports when no runnable ticket remains", () => {
+    const progress: TicketProgress = {
+      ticket: ticket("05", "documentation", "resolved", "Documentation"),
+      status: "resolved",
+      next: undefined,
+      remainingRunnable: 0,
+    };
+
+    assert.deepEqual(lines(renderTicketProgress(progress)), [
+      "✅ 05 Documentation — status now `resolved`.",
+      "Next: none (0 tickets left).",
+    ]);
+  });
+});
+
+describe("renderActiveRun", () => {
+  it("shows the folder, current ticket, remaining count, and session file", () => {
+    const run: ActiveRun = {
+      folderLabel: ".scratch/auth/issues",
+      totalTickets: 5,
+      currentTicket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+      remainingRunnable: 2,
+      sessionFile: "/sessions/03.jsonl",
+    };
+
+    assert.deepEqual(lines(renderActiveRun(run)), [
+      "🎫 Ticket runner active",
+      "",
+      "Folder: .scratch/auth/issues",
+      "Position: 03 Repository Layer",
+      "Executable remaining: 2 of 5",
+      "Session: /sessions/03.jsonl",
+    ]);
+  });
+
+  it("renders a run that has not started its first ticket yet", () => {
+    const run: ActiveRun = {
+      folderLabel: "issues",
+      totalTickets: 2,
+      currentTicket: undefined,
+      remainingRunnable: 2,
+      sessionFile: undefined,
+    };
+
+    const output = renderActiveRun(run);
+    assert.match(output, /Position: \(starting\)/);
+    assert.match(output, /Session: \(not saved\)/);
+  });
+});
+
+describe("renderRunOutcome", () => {
   const runnable = ["ready-for-agent"];
 
   it("reports nothing to run with the folder and runnable status", () => {
-    const output = renderStartOutcome(
+    const output = renderRunOutcome(
       { kind: "nothing-to-run" },
       ".scratch/auth/issues",
       runnable,
@@ -152,68 +222,158 @@ describe("renderStartOutcome", () => {
     );
   });
 
-  it("reports the status a successful ticket persisted", () => {
-    const output = renderStartOutcome(
-      {
-        kind: "success",
-        ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
-        status: "resolved",
-      },
-      ".scratch/auth/issues",
-      runnable,
-    );
-
-    assert.equal(output, "✅ 03 Repository Layer — status now `resolved`.");
-  });
-
-  it("reports a gate rejection with its reason", () => {
-    const outcome: StartOutcome = {
-      kind: "gate-rejected",
-      ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
-      status: "INCOMPLETE",
-      reason: "integration tests are failing",
+  it("summarises ran tickets and names every skip reason", () => {
+    const outcome: RunOutcome = {
+      kind: "finished",
+      ran: [
+        {
+          ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+          status: "resolved",
+        },
+        {
+          ticket: ticket("05", "documentation", "ready-for-agent", "Documentation"),
+          status: "resolved",
+        },
+      ],
+      skipped: [
+        {
+          ticket: ticket("04", "integration-tests", "ready-for-human", "Integration Tests"),
+          status: "ready-for-human",
+        },
+        { ticket: ticket("06", "wontfix", "wontfix", "Wontfix"), status: "wontfix" },
+      ],
+      remainingRunnable: 0,
     };
 
-    const output = renderStartOutcome(outcome, ".scratch/auth/issues", runnable);
+    assert.deepEqual(lines(renderRunOutcome(outcome, ".scratch/auth/issues", runnable)), [
+      "✅ Run finished · 0 tickets ready-for-agent.",
+      "Ran: 03 Repository Layer, 05 Documentation.",
+      "Skipped: 04 Integration Tests (ready-for-human), 06 Wontfix (wontfix).",
+    ]);
+  });
+
+  it("reports an empty skip list explicitly", () => {
+    const outcome: RunOutcome = {
+      kind: "finished",
+      ran: [{ ticket: ticket("01", "one", "ready-for-agent", "One"), status: "resolved" }],
+      skipped: [],
+      remainingRunnable: 0,
+    };
+
+    const output = renderRunOutcome(outcome, "issues", runnable);
+    assert.match(output, /Skipped: none\./);
+  });
+
+  it("reports a gate rejection, its reason, remaining count, and summary", () => {
+    const outcome: RunOutcome = {
+      kind: "stopped",
+      ran: [],
+      skipped: [
+        {
+          ticket: ticket("01", "one", "resolved", "One"),
+          status: "resolved",
+        },
+      ],
+      stop: {
+        kind: "gate-rejected",
+        ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+        status: "INCOMPLETE",
+        reason: "integration tests are failing",
+      },
+      remainingRunnable: 2,
+    };
+
+    const output = renderRunOutcome(outcome, ".scratch/auth/issues", runnable);
 
     assert.match(output, /^⏹ 03 Repository Layer is incomplete\./);
     assert.match(output, /Reason: integration tests are failing/);
-    assert.match(output, /Execution stopped\./);
+    assert.match(output, /Execution stopped · 2 tickets left\./);
+    assert.match(output, /Ran: none\./);
+    assert.match(output, /Skipped: 01 One \(resolved\)\./);
   });
 
   it("reports a malformed gate answer and the raw final message", () => {
-    const outcome: StartOutcome = {
-      kind: "gate-malformed",
-      ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
-      reason: "The gate returned no STATUS: line.",
-      text: "I finished everything.",
+    const outcome: RunOutcome = {
+      kind: "stopped",
+      ran: [],
+      skipped: [],
+      stop: {
+        kind: "gate-malformed",
+        ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+        reason: "The gate returned no STATUS: line.",
+        text: "I finished everything.",
+      },
+      remainingRunnable: 1,
     };
 
-    const output = renderStartOutcome(outcome, ".scratch/auth/issues", runnable);
+    const output = renderRunOutcome(outcome, ".scratch/auth/issues", runnable);
 
     assert.match(output, /unusable answer for 03 Repository Layer/);
     assert.match(output, /no STATUS: line/);
     assert.match(output, /I finished everything\./);
-    assert.match(output, /Execution stopped\./);
+    assert.match(output, /Execution stopped · 1 ticket left\./);
   });
 
   it("reports COMPLETE without a persisted status change", () => {
-    const outcome: StartOutcome = {
-      kind: "status-unchanged",
-      ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
-      status: "ready-for-agent",
+    const outcome: RunOutcome = {
+      kind: "stopped",
+      ran: [],
+      skipped: [],
+      stop: {
+        kind: "status-unchanged",
+        ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+        status: "ready-for-agent",
+      },
+      remainingRunnable: 1,
     };
 
-    const output = renderStartOutcome(outcome, ".scratch/auth/issues", runnable);
+    const output = renderRunOutcome(outcome, ".scratch/auth/issues", runnable);
 
-    assert.equal(
+    assert.match(
       output,
-      [
-        "⏹ Ticket 03-repository-layer reported COMPLETE,",
-        "but its ticket file is still ready-for-agent.",
-        "",
-        "Execution stopped.",
-      ].join("\n"),
+      /^⏹ Ticket 03-repository-layer reported COMPLETE,\nbut its ticket file is still ready-for-agent\./,
     );
+    assert.match(output, /Execution stopped · 1 ticket left\./);
+  });
+
+  it("reports a turn-limit stop", () => {
+    const outcome: RunOutcome = {
+      kind: "stopped",
+      ran: [],
+      skipped: [],
+      stop: {
+        kind: "turn-limit",
+        ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+        turns: 50,
+        maxTurns: 50,
+      },
+      remainingRunnable: 2,
+    };
+
+    const output = renderRunOutcome(outcome, ".scratch/auth/issues", runnable);
+
+    assert.match(output, /^⏹ 03 Repository Layer hit the 50-turn limit after 50 turns\./);
+    assert.match(output, /Execution stopped · 2 tickets left\./);
+  });
+
+  it("reports a child-session error with its phase and message", () => {
+    const outcome: RunOutcome = {
+      kind: "stopped",
+      ran: [],
+      skipped: [],
+      stop: {
+        kind: "session-error",
+        ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+        phase: "completion-gate",
+        message: "gate crashed",
+      },
+      remainingRunnable: 1,
+    };
+
+    const output = renderRunOutcome(outcome, ".scratch/auth/issues", runnable);
+
+    assert.match(output, /child session error during the completion gate\./);
+    assert.match(output, /gate crashed/);
+    assert.match(output, /Execution stopped · 1 ticket left\./);
   });
 });

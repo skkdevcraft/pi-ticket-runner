@@ -4,10 +4,16 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 
 import { loadConfig } from "./config.ts";
 import { errorMessage, TicketRunnerError } from "./errors.ts";
-import { startFirstRunnableTicket } from "./runner.ts";
+import { TicketRunState } from "./run-state.ts";
+import { runTickets } from "./runner.ts";
 import { createTicketSession, type TicketSessionFactory } from "./sessions.ts";
 import { loadTicketInventory } from "./tickets.ts";
-import { renderStartOutcome, renderTicketList } from "./ui.ts";
+import {
+  renderActiveRun,
+  renderRunOutcome,
+  renderTicketList,
+  renderTicketProgress,
+} from "./ui.ts";
 
 export const COMMAND_NAME = "ticket-runner";
 
@@ -33,6 +39,8 @@ export interface RegisterCommandOptions {
   readonly extensionPath?: string;
   /** Session factory, injectable so command behaviour can be tested without an LLM. */
   readonly createSession?: TicketSessionFactory;
+  /** In-memory run state, injectable so status behaviour can be tested. */
+  readonly state?: TicketRunState;
 }
 
 /**
@@ -114,10 +122,12 @@ export function registerTicketRunnerCommand(
   pi: ExtensionAPI,
   options: RegisterCommandOptions,
 ): void {
+  const state = options.state ?? new TicketRunState();
+
   pi.registerCommand(COMMAND_NAME, {
     description: "List and run local Markdown tickets, one fresh session per ticket",
     handler: async (args, ctx) => {
-      await runCommand(pi, options, args, ctx);
+      await runCommand(pi, options, state, args, ctx);
     },
   });
 }
@@ -125,6 +135,7 @@ export function registerTicketRunnerCommand(
 async function runCommand(
   pi: ExtensionAPI,
   options: RegisterCommandOptions,
+  state: TicketRunState,
   args: string,
   ctx: ExtensionCommandContext,
 ): Promise<void> {
@@ -132,12 +143,14 @@ async function runCommand(
     const command = parseCommandArgs(args);
     switch (command.subcommand) {
       case "list":
-        runList(pi, options, ctx, command.folder);
+        runList(pi, options, state, ctx, command.folder);
         return;
       case "start":
-        await runStart(pi, options, ctx, command.folder);
+        await runStart(pi, options, state, ctx, command.folder);
         return;
       case "status":
+        runStatus(pi, options, state, ctx);
+        return;
       case "stop":
         ctx.ui.notify(
           `/${COMMAND_NAME} ${command.subcommand} is not implemented yet.`,
@@ -156,6 +169,7 @@ async function runCommand(
 function runList(
   pi: ExtensionAPI,
   options: RegisterCommandOptions,
+  state: TicketRunState,
   ctx: ExtensionCommandContext,
   folder: string,
 ): void {
@@ -163,6 +177,7 @@ function runList(
   for (const warning of warnings) ctx.ui.notify(warning, "warning");
 
   const inventory = loadTicketInventory({ cwd: ctx.cwd, folder });
+  state.rememberFolder(folder);
   const content = renderTicketList(inventory, config.runnableStatuses);
 
   pi.sendMessage(
@@ -174,6 +189,7 @@ function runList(
 async function runStart(
   pi: ExtensionAPI,
   options: RegisterCommandOptions,
+  state: TicketRunState,
   ctx: ExtensionCommandContext,
   folder: string,
 ): Promise<void> {
@@ -181,7 +197,8 @@ async function runStart(
   for (const warning of warnings) ctx.ui.notify(warning, "warning");
 
   const inventory = loadTicketInventory({ cwd: ctx.cwd, folder });
-  const outcome = await startFirstRunnableTicket({
+  state.rememberFolder(folder);
+  const outcome = await runTickets({
     cwd: ctx.cwd,
     agentDir: options.agentDir,
     extensionPath: options.extensionPath ?? DEFAULT_EXTENSION_PATH,
@@ -189,6 +206,17 @@ async function runStart(
     config,
     createSession: options.createSession ?? createTicketSession,
     getCommands: () => pi.getCommands(),
+    state,
+    onProgress: (progress) => {
+      pi.sendMessage(
+        {
+          customType: COMMAND_NAME,
+          content: renderTicketProgress(progress),
+          display: true,
+        },
+        { triggerTurn: false },
+      );
+    },
     ...(ctx.model === undefined ? {} : { model: ctx.model }),
     ...(ctx.thinkingLevel === undefined ? {} : { thinkingLevel: ctx.thinkingLevel }),
   });
@@ -196,9 +224,44 @@ async function runStart(
   pi.sendMessage(
     {
       customType: COMMAND_NAME,
-      content: renderStartOutcome(outcome, inventory.folderLabel, config.runnableStatuses),
+      content: renderRunOutcome(outcome, inventory.folderLabel, config.runnableStatuses),
       display: true,
     },
+    { triggerTurn: false },
+  );
+}
+
+function runStatus(
+  pi: ExtensionAPI,
+  options: RegisterCommandOptions,
+  state: TicketRunState,
+  ctx: ExtensionCommandContext,
+): void {
+  const active = state.active;
+  if (active) {
+    pi.sendMessage(
+      { customType: COMMAND_NAME, content: renderActiveRun(active), display: true },
+      { triggerTurn: false },
+    );
+    return;
+  }
+
+  const folder = state.lastFolder;
+  if (folder === undefined) {
+    pi.sendMessage(
+      { customType: COMMAND_NAME, content: "No run active.", display: true },
+      { triggerTurn: false },
+    );
+    return;
+  }
+
+  const { config, warnings } = loadConfig({ cwd: ctx.cwd, agentDir: options.agentDir });
+  for (const warning of warnings) ctx.ui.notify(warning, "warning");
+
+  const inventory = loadTicketInventory({ cwd: ctx.cwd, folder });
+  const content = `${renderTicketList(inventory, config.runnableStatuses)}\n\nNo run active.`;
+  pi.sendMessage(
+    { customType: COMMAND_NAME, content, display: true },
     { triggerTurn: false },
   );
 }

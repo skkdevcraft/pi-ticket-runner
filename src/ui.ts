@@ -1,4 +1,5 @@
-import type { StartOutcome } from "./runner.ts";
+import type { ActiveRun } from "./run-state.ts";
+import type { RanTicket, RunOutcome, RunStop, SkippedTicket, TicketProgress } from "./runner.ts";
 import { isRunnableStatus } from "./status.ts";
 import type { TicketInventory } from "./tickets.ts";
 
@@ -53,39 +54,132 @@ function columnWidth(lengths: readonly number[]): number {
   return Math.max(0, ...lengths) + 4;
 }
 
-/** Render the outcome of `/ticket-runner start` for the main transcript. */
-export function renderStartOutcome(
-  outcome: StartOutcome,
+/** Render the progress message injected after a ticket passes the gate. */
+export function renderTicketProgress(progress: TicketProgress): string {
+  const ticket = progress.ticket;
+  const next = progress.next
+    ? `Next: ${progress.next.id} ${progress.next.title} (${countLabel(progress.remainingRunnable)} left).`
+    : `Next: none (${countLabel(progress.remainingRunnable)} left).`;
+
+  return [
+    `✅ ${ticket.id} ${ticket.title} — status now \`${progress.status}\`.`,
+    next,
+  ].join("\n");
+}
+
+/** Render the active-run state shown by `/ticket-runner status`. */
+export function renderActiveRun(run: ActiveRun): string {
+  const position = run.currentTicket
+    ? `${run.currentTicket.id} ${run.currentTicket.title}`
+    : "(starting)";
+
+  return [
+    "🎫 Ticket runner active",
+    "",
+    `Folder: ${run.folderLabel}`,
+    `Position: ${position}`,
+    `Executable remaining: ${run.remainingRunnable} of ${run.totalTickets}`,
+    `Session: ${run.sessionFile ?? "(not saved)"}`,
+  ].join("\n");
+}
+
+/** Render the final result of `/ticket-runner start` for the main transcript. */
+export function renderRunOutcome(
+  outcome: RunOutcome,
   folder: string,
   runnableStatuses: readonly string[],
 ): string {
   switch (outcome.kind) {
     case "nothing-to-run":
       return `✅ Nothing to run — no ticket in ${folder} is ${runnableStatuses.join(", ")}.`;
-    case "success":
-      return `✅ ${outcome.ticket.id} ${outcome.ticket.title} — status now \`${outcome.status}\`.`;
+    case "finished":
+      return [
+        `✅ Run finished · ${countLabel(outcome.remainingRunnable)} ${statusList(runnableStatuses)}.`,
+        ...renderSummary(outcome.ran, outcome.skipped),
+      ].join("\n");
+    case "stopped":
+      return [
+        renderStop(outcome.stop, outcome.remainingRunnable),
+        "",
+        ...renderSummary(outcome.ran, outcome.skipped),
+      ].join("\n");
+  }
+}
+
+function renderStop(stop: RunStop, remainingRunnable: number): string {
+  const stopped = `Execution stopped · ${countLabel(remainingRunnable)} left.`;
+
+  switch (stop.kind) {
     case "gate-rejected":
       return [
-        `⏹ ${outcome.ticket.id} ${outcome.ticket.title} is ${outcome.status.toLowerCase()}.`,
-        `Reason: ${outcome.reason || "no reason given."}`,
-        "Execution stopped.",
+        `⏹ ${stop.ticket.id} ${stop.ticket.title} is ${stop.status.toLowerCase()}.`,
+        `Reason: ${stop.reason || "no reason given."}`,
+        stopped,
       ].join("\n");
     case "gate-malformed":
       return [
-        `⏹ The completion gate returned an unusable answer for ${outcome.ticket.id} ${outcome.ticket.title}.`,
-        outcome.reason,
+        `⏹ The completion gate returned an unusable answer for ${stop.ticket.id} ${stop.ticket.title}.`,
+        stop.reason,
         "",
         "Final message:",
-        outcome.text ?? "(empty)",
+        stop.text ?? "(empty)",
         "",
-        "Execution stopped.",
+        stopped,
       ].join("\n");
     case "status-unchanged":
       return [
-        `⏹ Ticket ${outcome.ticket.id}-${outcome.ticket.slug} reported COMPLETE,`,
-        `but its ticket file is still ${outcome.status}.`,
+        `⏹ Ticket ${stop.ticket.id}-${stop.ticket.slug} reported COMPLETE,`,
+        `but its ticket file is still ${stop.status}.`,
         "",
-        "Execution stopped.",
+        stopped,
+      ].join("\n");
+    case "turn-limit":
+      return [
+        `⏹ ${stop.ticket.id} ${stop.ticket.title} hit the ${stop.maxTurns}-turn limit after ${stop.turns} turns.`,
+        stopped,
+      ].join("\n");
+    case "session-error":
+      return [
+        `⏹ ${stop.ticket.id} ${stop.ticket.title} — child session error during ${phaseLabel(stop.phase)}.`,
+        stop.message,
+        stopped,
       ].join("\n");
   }
+}
+
+function phaseLabel(phase: "create" | "implementation" | "completion-gate"): string {
+  switch (phase) {
+    case "create":
+      return "session creation";
+    case "implementation":
+      return "implementation";
+    case "completion-gate":
+      return "the completion gate";
+  }
+}
+
+function renderSummary(
+  ran: readonly RanTicket[],
+  skipped: readonly SkippedTicket[],
+): string[] {
+  return [
+    ran.length > 0
+      ? `Ran: ${ran.map((entry) => `${entry.ticket.id} ${entry.ticket.title}`).join(", ")}.`
+      : "Ran: none.",
+    skipped.length > 0
+      ? `Skipped: ${skipped
+          .map((entry) => `${entry.ticket.id} ${entry.ticket.title} (${entry.status})`)
+          .join(", ")}.`
+      : "Skipped: none.",
+  ];
+}
+
+function countLabel(count: number): string {
+  return `${count} ${count === 1 ? "ticket" : "tickets"}`;
+}
+
+function statusList(runnableStatuses: readonly string[]): string {
+  return runnableStatuses.length === 1
+    ? runnableStatuses[0] ?? "runnable"
+    : runnableStatuses.join(", ");
 }
