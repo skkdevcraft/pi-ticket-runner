@@ -27,9 +27,16 @@ interface SentMessage {
   readonly options: unknown;
 }
 
+interface UiCall {
+  readonly method: "setWidget" | "setStatus";
+  readonly key: string;
+  readonly value: unknown;
+}
+
 interface FakePi {
   readonly sent: SentMessage[];
   readonly notifications: Array<{ message: string; level: string }>;
+  readonly uiCalls: UiCall[];
   readonly registered: { readonly name?: string; readonly description?: string | undefined };
   run(args: string, cwd: string): Promise<void>;
   shutdown(): void;
@@ -88,6 +95,7 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
   } as unknown as ExtensionAPI;
 
   const notifications: Array<{ message: string; level: string }> = [];
+  const uiCalls: UiCall[] = [];
 
   registerTicketRunnerCommand(pi, {
     agentDir,
@@ -99,6 +107,7 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
   return {
     sent,
     notifications,
+    uiCalls,
     registered,
     shutdown() {
       for (const listener of shutdownHandlers) listener();
@@ -109,6 +118,12 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
         cwd,
         ui: {
           notify: (message: string, level: string) => notifications.push({ message, level }),
+          setWidget: (key: string, value: unknown) => {
+            uiCalls.push({ method: "setWidget", key, value });
+          },
+          setStatus: (key: string, value: unknown) => {
+            uiCalls.push({ method: "setStatus", key, value });
+          },
         },
       } as unknown as ExtensionCommandContext;
       await handler(args, ctx);
@@ -299,12 +314,14 @@ interface FakeSession extends TicketSession {
   readonly prompts: string[];
   readonly sessionOptions: CreateTicketSessionOptions[];
   disposed: number;
+  aborted: number;
+  unsubscribed: number;
   lastText: string | undefined;
 }
 
 function fakeSession(
   responses: ReadonlyArray<string | Error>,
-  onPrompt?: (prompt: string, index: number) => void,
+  onPrompt?: (prompt: string, index: number) => void | Promise<void>,
 ): {
   readonly created: FakeSession[];
   readonly create: (options: CreateTicketSessionOptions) => Promise<TicketSession>;
@@ -318,17 +335,23 @@ function fakeSession(
         prompts: [],
         sessionOptions: [sessionOptions],
         disposed: 0,
+        aborted: 0,
+        unsubscribed: 0,
         async prompt(text: string) {
           const index = session.prompts.length;
           session.prompts.push(text);
-          onPrompt?.(text, index);
+          await onPrompt?.(text, index);
           const response = responses[index];
           if (response instanceof Error) throw response;
           session.lastText = response ?? session.lastText;
         },
-        async abort() {},
+        async abort() {
+          session.aborted += 1;
+        },
         subscribe(_listener: (event: ChildEvent) => void) {
-          return () => {};
+          return () => {
+            session.unsubscribed += 1;
+          };
         },
         getLastAssistantText() {
           return session.lastText;
@@ -654,8 +677,56 @@ describe("/ticket-runner status", () => {
   });
 });
 
-describe("/ticket-runner other subcommands", () => {
-  it("reports stop as not implemented yet", async () => {
+describe("/ticket-runner stop", () => {
+  it("stops the active run, aborts the child, releases the lock, and reports the interruption", async () => {
+    const tree = createTempTree();
+    const first = tree.write(
+      "issues/01-first.md",
+      ticketMarkdown({ title: "# 01: First" }),
+    );
+    tree.write("issues/02-second.md", ticketMarkdown({ title: "# 02: Second" }));
+    let pi: FakePi;
+    let releases = 0;
+    const fake = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      async (_prompt, index) => {
+        if (index === 0) await pi.run("stop", tree.root);
+      },
+    );
+    pi = createFakePi(tree.path("agent"), {
+      createSession: fake.create,
+      openGuard: () => ({
+        git: { root: tree.root, branch: "main", head: "abc123" },
+        checkUnchanged: () => undefined,
+        acceptHead: () => undefined,
+        release: () => {
+          releases += 1;
+        },
+      }),
+    });
+
+    await pi.run("start issues", tree.root);
+
+    assert.equal(fake.created.length, 1);
+    assert.equal(fake.created[0]?.prompts.length, 1, "the gate must not be sent");
+    assert.equal(fake.created[0]?.aborted, 1);
+    assert.equal(fake.created[0]?.disposed, 1);
+    assert.equal(fake.created[0]?.unsubscribed, 1);
+    assert.equal(releases, 1);
+    assert.equal(readFileSync(first, "utf8"), ticketMarkdown({ title: "# 01: First" }));
+    assert.deepEqual(pi.uiCalls, [
+      { method: "setWidget", key: "ticket-runner", value: undefined },
+      { method: "setStatus", key: "ticket-runner", value: undefined },
+    ]);
+
+    const content = pi.sent[pi.sent.length - 1]?.message.content as string;
+    assert.match(content, /^⏹ Execution interrupted at 01 First · 2 tickets left\./);
+    assert.match(content, /Remaining tickets not started\./);
+    assert.match(content, /Ran: none\./);
+    assert.doesNotMatch(content, /Ran: 01 First/);
+  });
+
+  it("reports that no run is active when idle", async () => {
     const tree = createTempTree();
     const fake = createFakePi(tree.path("agent"));
 
@@ -664,9 +735,46 @@ describe("/ticket-runner other subcommands", () => {
     assert.equal(fake.sent.length, 0);
     assert.equal(fake.notifications.length, 1);
     assert.equal(fake.notifications[0]?.level, "warning");
-    assert.match(fake.notifications[0]?.message ?? "", /not implemented yet/);
+    assert.match(fake.notifications[0]?.message ?? "", /No ticket run is active/);
   });
 
+  it("leaves the interrupted ticket runnable for the next start", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
+    let stopping: FakePi;
+    const firstRun = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      async (_prompt, index) => {
+        if (index === 0) await stopping.run("stop", tree.root);
+      },
+    );
+    stopping = createFakePi(tree.path("agent"), { createSession: firstRun.create });
+
+    await stopping.run("start issues", tree.root);
+    assert.match(
+      stopping.sent[stopping.sent.length - 1]?.message.content as string,
+      /Execution interrupted at 01 First/,
+    );
+
+    const secondRun = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      (_prompt, index) => {
+        if (index === 1) resolveTicket(tree, "01-first.md");
+      },
+    );
+    const restarted = createFakePi(tree.path("agent"), { createSession: secondRun.create });
+
+    await restarted.run("start issues", tree.root);
+
+    assert.equal(secondRun.created.length, 1);
+    assert.equal(secondRun.created[0]?.prompts[0], "/skill:implement issues/01-first.md");
+    const summary = restarted.sent[restarted.sent.length - 1]?.message.content as string;
+    assert.match(summary, /✅ Run finished/);
+    assert.match(summary, /Ran: 01 First\./);
+  });
+});
+
+describe("/ticket-runner other subcommands", () => {
   it("reports invalid invocations as errors", async () => {
     const tree = createTempTree();
     const fake = createFakePi(tree.path("agent"));

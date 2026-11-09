@@ -34,6 +34,72 @@ export const IMPLEMENT_SKILL_NAME = "skill:implement";
 /** The explicit prompt command used to invoke the implement skill. */
 export const IMPLEMENT_PROMPT_COMMAND = `/${IMPLEMENT_SKILL_NAME}`;
 
+/** A handle to one active child, used to abort it on cancellation. */
+export interface CancellationHandle {
+  /** Stop accepting future aborts for this child. */
+  detach(): void;
+  /** Resolves once any abort requested for this child has settled. */
+  aborted(): Promise<void>;
+}
+
+/**
+ * The run's cancellation flag plus the active child's abort.
+ *
+ * `/ticket-runner stop` calls {@link cancel} from another command invocation
+ * while the sequential loop is awaiting the child. The loop checks the flag
+ * after every awaited operation, so a stop that lands mid-prompt can never let
+ * it start the next ticket. Abort failures are swallowed because cancellation
+ * must always be able to finish cleaning up.
+ */
+export class RunCancellation {
+  private cancelledFlag = false;
+  private activeAbort: (() => Promise<void>) | undefined;
+  private abortSettled: Promise<void> = Promise.resolve();
+
+  /** True once a stop has been requested; never reset within one run. */
+  get cancelled(): boolean {
+    return this.cancelledFlag;
+  }
+
+  /** Mark the run cancelled and abort the active child, awaiting the abort. */
+  cancel(): Promise<void> {
+    this.cancelledFlag = true;
+    return this.abortActive();
+  }
+
+  /**
+   * Register the active child's abort. If cancellation was already requested
+   * while the session was being created, the child is aborted immediately.
+   */
+  attach(abort: () => Promise<void>): CancellationHandle {
+    this.activeAbort = abort;
+    if (this.cancelledFlag) this.abortActive();
+
+    let detached = false;
+    return {
+      detach: () => {
+        if (detached) return;
+        detached = true;
+        if (this.activeAbort === abort) this.activeAbort = undefined;
+      },
+      aborted: () => this.abortSettled,
+    };
+  }
+
+  private abortActive(): Promise<void> {
+    const abort = this.activeAbort;
+    if (abort === undefined) return this.abortSettled;
+
+    this.activeAbort = undefined;
+    try {
+      this.abortSettled = abort().catch(() => {});
+    } catch {
+      this.abortSettled = Promise.resolve();
+    }
+    return this.abortSettled;
+  }
+}
+
 /** A ticket the run implemented, with the status it persisted. */
 export interface RanTicket {
   readonly ticket: Ticket;
@@ -83,7 +149,8 @@ export type RunStop =
       readonly kind: "git-check-error";
       readonly ticket: Ticket;
       readonly message: string;
-    };
+    }
+  | { readonly kind: "interrupted"; readonly ticket: Ticket };
 
 /** The final result of one `/ticket-runner start` invocation. */
 export type RunOutcome =
@@ -143,6 +210,11 @@ export interface RunTicketsOptions {
   readonly onProgress?: ((progress: TicketProgress) => void) | undefined;
   /** In-memory state observable by `/ticket-runner status`. */
   readonly state?: TicketRunState | undefined;
+  /**
+   * Cancellation flag and active-child abort, shared with
+   * `/ticket-runner stop`. Defaults to a cancellation that is never requested.
+   */
+  readonly cancellation?: RunCancellation | undefined;
 }
 
 /** True when the implement skill is invokable as `/skill:implement`. */
@@ -164,6 +236,7 @@ export function hasImplementSkill(commands: readonly SlashCommandInfo[]): boolea
 export async function runTickets(options: RunTicketsOptions): Promise<RunOutcome> {
   const readStatus = options.readStatus ?? readTicketStatus;
   const runnableStatuses = options.config.runnableStatuses;
+  const cancellation = options.cancellation ?? new RunCancellation();
   const ran: RanTicket[] = [];
   const skipped: SkippedTicket[] = [];
 
@@ -201,7 +274,20 @@ export async function runTickets(options: RunTicketsOptions): Promise<RunOutcome
       // Statuses are read from disk before every ticket, never from run state.
       statuses = readAllStatuses(options.inventory, readStatus);
       const status = statuses.get(ticket) ?? "";
-      if (!isRunnableStatus(status, runnableStatuses)) {
+      const runnable = isRunnableStatus(status, runnableStatuses);
+
+      // Cancellation takes precedence over launching the next ticket. Report
+      // the ticket this iteration would have worked on.
+      if (cancellation.cancelled) {
+        return stopped(options, readStatus, ran, skipped, {
+          kind: "interrupted",
+          ticket: runnable
+            ? ticket
+            : firstRunnable(options.inventory.tickets, statuses, runnableStatuses) ?? ticket,
+        });
+      }
+
+      if (!runnable) {
         skipped.push({ ticket, status });
         continue;
       }
@@ -240,15 +326,35 @@ export async function runTickets(options: RunTicketsOptions): Promise<RunOutcome
         );
       }
 
+      const handle = cancellation.attach(() => session.abort());
+
+      // A stop that landed while the session was being created must abort and
+      // dispose this child without prompting it.
+      if (cancellation.cancelled) {
+        await handle.aborted();
+        handle.detach();
+        session.dispose();
+        return stopped(options, readStatus, ran, skipped, { kind: "interrupted", ticket });
+      }
+
       options.state?.setSessionFile(session.sessionFile);
 
       let attempt: TicketAttempt;
       try {
-        attempt = await runTicketAttempt(session, ticket, options, readStatus);
+        attempt = await runTicketAttempt(session, ticket, options, readStatus, cancellation);
       } finally {
-        // The subscription is removed inside the attempt; dispose never deletes
-        // the persisted session file.
+        // The subscription is removed inside the attempt. Detach before waiting
+        // so no abort can start after this point; dispose never deletes the
+        // persisted session file.
+        handle.detach();
+        await handle.aborted();
         session.dispose();
+      }
+
+      // Cancellation wins even when it arrived just after the attempt settled:
+      // no ticket is ever reported as advanced by an interrupted run.
+      if (cancellation.cancelled) {
+        return stopped(options, readStatus, ran, skipped, { kind: "interrupted", ticket });
       }
 
       if (attempt.kind === "stop") {
@@ -312,6 +418,7 @@ async function runTicketAttempt(
   ticket: Ticket,
   options: RunTicketsOptions,
   readStatus: (ticket: Ticket) => string,
+  cancellation: RunCancellation,
 ): Promise<TicketAttempt> {
   const maxTurns = options.config.maxTurnsPerTicket;
   let phase: "implementation" | "completion-gate" = "implementation";
@@ -339,6 +446,12 @@ async function runTicketAttempt(
     try {
       await session.prompt(`${IMPLEMENT_PROMPT_COMMAND} ${ticket.reference}`);
     } catch (error) {
+      if (cancellation.cancelled) {
+        // The turn-limit abort may already be in flight; never dispose before
+        // every requested abort has settled.
+        await abortPromise;
+        return interruptedAttempt(ticket);
+      }
       if (turnLimitReached) {
         await abortPromise;
         return turnLimitStop();
@@ -346,9 +459,14 @@ async function runTicketAttempt(
       return sessionError(ticket, "implementation", error);
     }
 
+    if (cancellation.cancelled) {
+      await abortPromise;
+      return interruptedAttempt(ticket);
+    }
+
     if (turnLimitReached) {
       await abortPromise;
-      return turnLimitStop();
+      return cancellation.cancelled ? interruptedAttempt(ticket) : turnLimitStop();
     }
 
     phase = "completion-gate";
@@ -361,8 +479,11 @@ async function runTicketAttempt(
         ),
       );
     } catch (error) {
+      if (cancellation.cancelled) return interruptedAttempt(ticket);
       return sessionError(ticket, "completion-gate", error);
     }
+
+    if (cancellation.cancelled) return interruptedAttempt(ticket);
 
     const gate = parseGateResult(session.getLastAssistantText());
     if (gate.kind === "malformed") {
@@ -398,6 +519,10 @@ function sessionError(
     kind: "stop",
     stop: { kind: "session-error", ticket, phase, message: errorMessage(error) },
   };
+}
+
+function interruptedAttempt(ticket: Ticket): TicketAttemptStop {
+  return { kind: "stop", stop: { kind: "interrupted", ticket } };
 }
 
 function gitStop(ticket: Ticket, change: GitStateChange): RunStop {

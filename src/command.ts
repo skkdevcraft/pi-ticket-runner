@@ -6,7 +6,7 @@ import { loadConfig } from "./config.ts";
 import { errorMessage, TicketRunnerError } from "./errors.ts";
 import type { RepositoryGuard, RepositoryGuardFactory } from "./repository.ts";
 import { TicketRunState } from "./run-state.ts";
-import { runTickets } from "./runner.ts";
+import { RunCancellation, runTickets } from "./runner.ts";
 import { createTicketSession, type TicketSessionFactory } from "./sessions.ts";
 import { loadTicketInventory } from "./tickets.ts";
 import {
@@ -120,6 +120,13 @@ function splitCommandTokens(text: string): string[] {
   return tokens;
 }
 
+/** Hooks shared between the command handler and an in-flight run. */
+interface RunHooks {
+  onGuardChange(guard: RepositoryGuard | undefined): void;
+  getCancellation(): RunCancellation | undefined;
+  setCancellation(cancellation: RunCancellation | undefined): void;
+}
+
 /** Register `/ticket-runner` with Pi. */
 export function registerTicketRunnerCommand(
   pi: ExtensionAPI,
@@ -127,18 +134,29 @@ export function registerTicketRunnerCommand(
 ): void {
   const state = options.state ?? new TicketRunState();
   let activeGuard: RepositoryGuard | undefined;
+  let activeCancellation: RunCancellation | undefined;
 
-  // Quitting or reloading Pi must never leave a repository locked.
+  // Quitting or reloading Pi must abort the child and must never leave a
+  // repository locked. The run's own cleanup releases the lock again
+  // (idempotently) once the abort settles.
   pi.on("session_shutdown", () => {
     activeGuard?.release();
     activeGuard = undefined;
+    void activeCancellation?.cancel();
+    activeCancellation = undefined;
   });
 
   pi.registerCommand(COMMAND_NAME, {
     description: "List and run local Markdown tickets, one fresh session per ticket",
     handler: async (args, ctx) => {
-      await runCommand(pi, options, state, args, ctx, (guard) => {
-        activeGuard = guard;
+      await runCommand(pi, options, state, args, ctx, {
+        onGuardChange: (guard) => {
+          activeGuard = guard;
+        },
+        getCancellation: () => activeCancellation,
+        setCancellation: (cancellation) => {
+          activeCancellation = cancellation;
+        },
       });
     },
   });
@@ -150,7 +168,7 @@ async function runCommand(
   state: TicketRunState,
   args: string,
   ctx: ExtensionCommandContext,
-  onGuardChange: (guard: RepositoryGuard | undefined) => void,
+  hooks: RunHooks,
 ): Promise<void> {
   try {
     const command = parseCommandArgs(args);
@@ -159,16 +177,13 @@ async function runCommand(
         runList(pi, options, state, ctx, command.folder);
         return;
       case "start":
-        await runStart(pi, options, state, ctx, command.folder, command.allowDirty, onGuardChange);
+        await runStart(pi, options, state, ctx, command.folder, command.allowDirty, hooks);
         return;
       case "status":
         runStatus(pi, options, state, ctx);
         return;
       case "stop":
-        ctx.ui.notify(
-          `/${COMMAND_NAME} ${command.subcommand} is not implemented yet.`,
-          "warning",
-        );
+        await runStop(hooks, ctx);
         return;
     }
   } catch (error) {
@@ -206,47 +221,74 @@ async function runStart(
   ctx: ExtensionCommandContext,
   folder: string,
   allowDirty: boolean,
-  onGuardChange: (guard: RepositoryGuard | undefined) => void,
+  hooks: RunHooks,
 ): Promise<void> {
   const { config, warnings } = loadConfig({ cwd: ctx.cwd, agentDir: options.agentDir });
   for (const warning of warnings) ctx.ui.notify(warning, "warning");
 
   const inventory = loadTicketInventory({ cwd: ctx.cwd, folder });
   state.rememberFolder(folder);
-  const outcome = await runTickets({
-    cwd: ctx.cwd,
-    agentDir: options.agentDir,
-    extensionPath: options.extensionPath ?? DEFAULT_EXTENSION_PATH,
-    inventory,
-    config,
-    createSession: options.createSession ?? createTicketSession,
-    getCommands: () => pi.getCommands(),
-    state,
-    allowDirty,
-    onGuardChange,
-    ...(options.openGuard === undefined ? {} : { openGuard: options.openGuard }),
-    onProgress: (progress) => {
-      pi.sendMessage(
-        {
-          customType: COMMAND_NAME,
-          content: renderTicketProgress(progress),
-          display: true,
-        },
-        { triggerTurn: false },
-      );
-    },
-    ...(ctx.model === undefined ? {} : { model: ctx.model }),
-    ...(ctx.thinkingLevel === undefined ? {} : { thinkingLevel: ctx.thinkingLevel }),
-  });
 
-  pi.sendMessage(
-    {
-      customType: COMMAND_NAME,
-      content: renderRunOutcome(outcome, inventory.folderLabel, config.runnableStatuses),
-      display: true,
-    },
-    { triggerTurn: false },
-  );
+  const cancellation = new RunCancellation();
+  hooks.setCancellation(cancellation);
+
+  try {
+    const outcome = await runTickets({
+      cwd: ctx.cwd,
+      agentDir: options.agentDir,
+      extensionPath: options.extensionPath ?? DEFAULT_EXTENSION_PATH,
+      inventory,
+      config,
+      createSession: options.createSession ?? createTicketSession,
+      getCommands: () => pi.getCommands(),
+      state,
+      allowDirty,
+      cancellation,
+      onGuardChange: hooks.onGuardChange,
+      ...(options.openGuard === undefined ? {} : { openGuard: options.openGuard }),
+      onProgress: (progress) => {
+        pi.sendMessage(
+          {
+            customType: COMMAND_NAME,
+            content: renderTicketProgress(progress),
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+      },
+      ...(ctx.model === undefined ? {} : { model: ctx.model }),
+      ...(ctx.thinkingLevel === undefined ? {} : { thinkingLevel: ctx.thinkingLevel }),
+    });
+
+    pi.sendMessage(
+      {
+        customType: COMMAND_NAME,
+        content: renderRunOutcome(outcome, inventory.folderLabel, config.runnableStatuses),
+        display: true,
+      },
+      { triggerTurn: false },
+    );
+  } finally {
+    // Every run exit path, including interruption and failure, clears the live
+    // widget and footer. `state.end()` inside the runner unblocks main input.
+    ctx.ui.setWidget(COMMAND_NAME, undefined);
+    ctx.ui.setStatus(COMMAND_NAME, undefined);
+    if (hooks.getCancellation() === cancellation) hooks.setCancellation(undefined);
+  }
+}
+
+/**
+ * Stop the active run. Cancellation aborts the active child and awaits the
+ * abort; the sequential loop then unsubscribes, disposes, releases the lock,
+ * and reports the interruption through its normal `start` outcome.
+ */
+async function runStop(hooks: RunHooks, ctx: ExtensionCommandContext): Promise<void> {
+  const cancellation = hooks.getCancellation();
+  if (cancellation === undefined) {
+    ctx.ui.notify("No ticket run is active.", "warning");
+    return;
+  }
+  await cancellation.cancel();
 }
 
 function runStatus(

@@ -14,6 +14,7 @@ import {
 import { TicketRunState } from "../src/run-state.ts";
 import {
   hasImplementSkill,
+  RunCancellation,
   runTickets,
   type RanTicket,
   type RunStop,
@@ -74,11 +75,14 @@ interface PromptContext {
 interface FakeSessionOptions {
   readonly responses?: readonly (string | Error)[];
   readonly onPrompt?: (context: PromptContext) => void | Promise<void>;
+  /** Shared log for asserting cleanup ordering across sessions and the guard. */
+  readonly order?: string[];
 }
 
 interface FakeSession extends TicketSession {
   readonly prompts: string[];
   readonly sessionOptions: CreateTicketSessionOptions[];
+  readonly events: string[];
   disposed: number;
   aborted: number;
   subscribed: number;
@@ -104,6 +108,7 @@ function fakeSessionFactory(options: FakeSessionOptions = {}): {
         sessionFile: `/sessions/${sessionIndex + 1}.jsonl`,
         prompts: [],
         sessionOptions: [sessionOptions],
+        events: [],
         disposed: 0,
         aborted: 0,
         subscribed: 0,
@@ -122,12 +127,16 @@ function fakeSessionFactory(options: FakeSessionOptions = {}): {
         },
         async abort() {
           session.aborted += 1;
+          session.events.push("abort");
+          options.order?.push("abort");
         },
         subscribe(listener: (event: ChildEvent) => void) {
           session.subscribed += 1;
           listeners.add(listener);
           return () => {
             session.unsubscribed += 1;
+            session.events.push("unsubscribe");
+            options.order?.push("unsubscribe");
             listeners.delete(listener);
           };
         },
@@ -136,6 +145,8 @@ function fakeSessionFactory(options: FakeSessionOptions = {}): {
         },
         dispose() {
           session.disposed += 1;
+          session.events.push("dispose");
+          options.order?.push("dispose");
         },
       };
       sessions.push(session);
@@ -939,5 +950,283 @@ describe("runTickets: turn limit", () => {
     assert.equal(outcome.kind, "finished");
     assert.equal(fake.sessions[0]?.aborted, 0);
     assert.equal(fake.sessions[0]?.prompts.length, 2);
+  });
+});
+
+describe("runTickets: interruption", () => {
+  it("stops before creating a session when cancellation was already requested", async () => {
+    const cancellation = new RunCancellation();
+    await cancellation.cancel();
+    const fake = fakeSessionFactory({ responses: ["implemented", COMPLETE] });
+    const guard = fakeGuard();
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent", "First")),
+        createSession: fake.create,
+        readStatus: (value) => value.status,
+        cancellation,
+        openGuard: () => guard,
+      }),
+    );
+
+    assert.equal(outcome.kind, "stopped");
+    assert.equal(outcome.kind === "stopped" ? outcome.stop.kind : undefined, "interrupted");
+    assert.equal(
+      outcome.kind === "stopped" && outcome.stop.kind === "interrupted"
+        ? outcome.stop.ticket.id
+        : undefined,
+      "01",
+    );
+    assert.equal(outcome.kind === "stopped" ? outcome.remainingRunnable : -1, 1);
+    assert.equal(fake.sessions.length, 0);
+    assert.equal(guard.released, 1);
+  });
+
+  it("cancels during the implementation prompt without sending the gate or advancing", async () => {
+    const cancellation = new RunCancellation();
+    const statuses = new Map([
+      ["01-ticket-01.md", "ready-for-agent"],
+      ["02-ticket-02.md", "ready-for-agent"],
+    ]);
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: async ({ promptIndex }) => {
+        if (promptIndex === 0) await cancellation.cancel();
+      },
+    });
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(
+          ticket("01", "ready-for-agent", "First"),
+          ticket("02", "ready-for-agent", "Second"),
+        ),
+        createSession: fake.create,
+        readStatus: statusReader(statuses),
+        cancellation,
+      }),
+    );
+
+    assert.equal(outcome.kind, "stopped");
+    assert.equal(outcome.kind === "stopped" ? outcome.stop.kind : undefined, "interrupted");
+    assert.equal(
+      outcome.kind === "stopped" && outcome.stop.kind === "interrupted"
+        ? outcome.stop.ticket.id
+        : undefined,
+      "01",
+    );
+    assert.deepEqual(outcome.kind === "stopped" ? ranIds(outcome.ran) : [], []);
+    assert.equal(outcome.kind === "stopped" ? outcome.remainingRunnable : -1, 2);
+
+    const session = fake.sessions[0];
+    assert.ok(session);
+    assert.equal(session.prompts.length, 1, "the completion gate must not be sent");
+    assert.equal(session.aborted, 1);
+    assert.equal(session.disposed, 1);
+    assert.equal(session.unsubscribed, 1);
+    assert.equal(session.sessionFile, "/sessions/1.jsonl");
+    assert.equal(fake.sessions.length, 1);
+  });
+
+  it("clears the active run state so main-session input can resume", async () => {
+    const cancellation = new RunCancellation();
+    const state = new TicketRunState();
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: async ({ promptIndex }) => {
+        if (promptIndex === 0) await cancellation.cancel();
+      },
+    });
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent", "First")),
+        createSession: fake.create,
+        readStatus: (value) => value.status,
+        cancellation,
+        state,
+      }),
+    );
+
+    assert.equal(outcome.kind, "stopped");
+    assert.equal(state.active, undefined);
+    assert.equal(state.lastFolder, "issues");
+  });
+
+  it("cancels during the completion gate and leaves the ticket runnable", async () => {
+    const cancellation = new RunCancellation();
+    const statuses = new Map([["01-ticket-01.md", "ready-for-agent"]]);
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: async ({ promptIndex }) => {
+        if (promptIndex === 1) await cancellation.cancel();
+      },
+    });
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent", "First")),
+        createSession: fake.create,
+        readStatus: statusReader(statuses),
+        cancellation,
+      }),
+    );
+
+    assert.equal(outcome.kind, "stopped");
+    assert.equal(outcome.kind === "stopped" ? outcome.stop.kind : undefined, "interrupted");
+    assert.deepEqual(outcome.kind === "stopped" ? ranIds(outcome.ran) : [], []);
+    assert.equal(outcome.kind === "stopped" ? outcome.remainingRunnable : -1, 1);
+    assert.equal(fake.sessions[0]?.prompts.length, 2);
+    assert.equal(fake.sessions[0]?.aborted, 1);
+    assert.equal(fake.sessions[0]?.disposed, 1);
+    assert.equal(statuses.get("01-ticket-01.md"), "ready-for-agent");
+  });
+
+  it("cancels between tickets and does not start the next one", async () => {
+    const cancellation = new RunCancellation();
+    const statuses = new Map([
+      ["01-ticket-01.md", "ready-for-agent"],
+      ["02-ticket-02.md", "ready-for-agent"],
+    ]);
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: ({ promptIndex }) => {
+        if (promptIndex === 1) statuses.set("01-ticket-01.md", "resolved");
+      },
+    });
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(
+          ticket("01", "ready-for-agent", "First"),
+          ticket("02", "ready-for-agent", "Second"),
+        ),
+        createSession: fake.create,
+        readStatus: statusReader(statuses),
+        cancellation,
+        onProgress: () => {
+          void cancellation.cancel();
+        },
+      }),
+    );
+
+    assert.equal(outcome.kind, "stopped");
+    assert.equal(outcome.kind === "stopped" ? outcome.stop.kind : undefined, "interrupted");
+    assert.equal(
+      outcome.kind === "stopped" && outcome.stop.kind === "interrupted"
+        ? outcome.stop.ticket.id
+        : undefined,
+      "02",
+    );
+    assert.deepEqual(outcome.kind === "stopped" ? ranIds(outcome.ran) : [], ["01"]);
+    assert.equal(outcome.kind === "stopped" ? outcome.remainingRunnable : -1, 1);
+    assert.equal(fake.sessions.length, 1);
+    assert.equal(statuses.get("02-ticket-02.md"), "ready-for-agent");
+  });
+
+  it("stops when cancellation arrives while the child session is being created", async () => {
+    const cancellation = new RunCancellation();
+    const fake = fakeSessionFactory({ responses: ["implemented", COMPLETE] });
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent", "First")),
+        createSession: async (sessionOptions) => {
+          const session = await fake.create(sessionOptions);
+          await cancellation.cancel();
+          return session;
+        },
+        readStatus: (value) => value.status,
+        cancellation,
+      }),
+    );
+
+    assert.equal(outcome.kind, "stopped");
+    assert.equal(outcome.kind === "stopped" ? outcome.stop.kind : undefined, "interrupted");
+    assert.equal(
+      outcome.kind === "stopped" && outcome.stop.kind === "interrupted"
+        ? outcome.stop.ticket.id
+        : undefined,
+      "01",
+    );
+    assert.equal(fake.sessions[0]?.prompts.length, 0);
+    assert.equal(fake.sessions[0]?.aborted, 1);
+    assert.equal(fake.sessions[0]?.disposed, 1);
+    assert.equal(fake.sessions[0]?.subscribed, 0);
+  });
+
+  it("removes the subscription, waits for the abort, disposes, then releases the lock", async () => {
+    const cancellation = new RunCancellation();
+    const order: string[] = [];
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      order,
+      onPrompt: async ({ promptIndex }) => {
+        if (promptIndex === 0) await cancellation.cancel();
+      },
+    });
+    const guard = fakeGuard();
+    const release = guard.release.bind(guard);
+    guard.release = () => {
+      order.push("release");
+      release();
+    };
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent", "First")),
+        createSession: fake.create,
+        readStatus: (value) => value.status,
+        cancellation,
+        openGuard: () => guard,
+      }),
+    );
+
+    assert.equal(outcome.kind, "stopped");
+    assert.deepEqual(order, ["abort", "unsubscribe", "dispose", "release"]);
+  });
+
+  it("leaves an interrupted ticket eligible for the next start", async () => {
+    const cancellation = new RunCancellation();
+    const statuses = new Map([["01-ticket-01.md", "ready-for-agent"]]);
+    const first = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: async ({ promptIndex }) => {
+        if (promptIndex === 0) await cancellation.cancel();
+      },
+    });
+
+    const interrupted = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent", "First")),
+        createSession: first.create,
+        readStatus: statusReader(statuses),
+        cancellation,
+      }),
+    );
+
+    assert.equal(interrupted.kind, "stopped");
+    assert.equal(statuses.get("01-ticket-01.md"), "ready-for-agent");
+
+    const second = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: ({ promptIndex }) => {
+        if (promptIndex === 1) statuses.set("01-ticket-01.md", "resolved");
+      },
+    });
+
+    const resumed = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent", "First")),
+        createSession: second.create,
+        readStatus: statusReader(statuses),
+      }),
+    );
+
+    assert.equal(second.sessions.length, 1);
+    assert.equal(second.sessions[0]?.prompts[0], "/skill:implement issues/01-ticket-01.md");
+    assert.equal(resumed.kind, "finished");
+    assert.deepEqual(resumed.kind === "finished" ? ranIds(resumed.ran) : [], ["01"]);
   });
 });

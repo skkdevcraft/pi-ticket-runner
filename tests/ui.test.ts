@@ -336,6 +336,30 @@ describe("renderRunOutcome", () => {
     assert.match(output, /Execution stopped · 1 ticket left\./);
   });
 
+  it("reports an interruption at the current ticket and the remaining runnable count", () => {
+    const outcome: RunOutcome = {
+      kind: "stopped",
+      ran: [
+        {
+          ticket: ticket("01", "one", "ready-for-agent", "One"),
+          status: "resolved",
+        },
+      ],
+      skipped: [],
+      stop: {
+        kind: "interrupted",
+        ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+      },
+      remainingRunnable: 2,
+    };
+
+    const output = renderRunOutcome(outcome, ".scratch/auth/issues", runnable);
+
+    assert.match(output, /^⏹ Execution interrupted at 03 Repository Layer · 2 tickets left\./);
+    assert.match(output, /Remaining tickets not started\./);
+    assert.match(output, /Ran: 01 One\./);
+  });
+
   it("reports a turn-limit stop", () => {
     const outcome: RunOutcome = {
       kind: "stopped",

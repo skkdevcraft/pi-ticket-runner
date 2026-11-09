@@ -161,6 +161,11 @@ function renderStop(stop: RunStop, remainingRunnable: number): string {
         stop.message,
         stopped,
       ].join("\n");
+    case "interrupted":
+      return [
+        `⏹ Execution interrupted at ${stop.ticket.id} ${stop.ticket.title} · ${countLabel(remainingRunnable)} left.`,
+        "Remaining tickets not started.",
+      ].join("\n");
   }
 }
 
