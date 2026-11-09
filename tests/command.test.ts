@@ -970,6 +970,40 @@ describe("session frames and footer", () => {
     assert.ok(pi.uiCalls.every((call) => call.method === "setStatus"));
   });
 
+  it("repaints live frames through the footer status without new session entries", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
+    tree.write(".pi/ticket-runner.json", JSON.stringify({ liveFrameUpdateIntervalMs: 0 }));
+    const fake = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      (prompt, index, session) => {
+        if (index === 0) {
+          session.emit(textDelta("writing code"));
+          session.emit(toolStart("edit"));
+          session.emit(turnEnd());
+          return;
+        }
+        resolveTicket(tree, "01-first.md");
+      },
+    );
+    const pi = createFakePi(tree.path("agent"), { createSession: fake.create });
+
+    await pi.run("start issues", tree.root);
+
+    const renderedStatuses = pi.uiCalls
+      .filter((call) => call.method === "setStatus")
+      .map((call) => call.value);
+    assert.ok(
+      renderedStatuses.filter((value) => value === "🎫 1 left · 01-first").length > 1,
+      "live child events must repaint the frame through the footer status",
+    );
+    assert.deepEqual(
+      frameSummaries(pi).map((frame) => frame.status),
+      ["running", "done"],
+      "live repaints never append a session entry",
+    );
+  });
+
   it("renders the live creation entry, then the settlement entry after a reload", async () => {
     const tree = createTempTree();
     tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));

@@ -16,5 +16,6 @@ Replace the widget with one inline session frame per child session, built as a T
 
 - Frames are read-only renderings of child messages, not native tool rows. They cannot participate in Pi's native tool grouping or mouse routing.
 - Expanded transcripts are lazy, bounded, and never enter the parent's LLM context.
-- Live updates use an in-memory view model plus a settled summary entry; there is no public update-in-place API for custom entries.
+- Live updates use an in-memory view model plus a settled summary entry; there is no public update-in-place API for custom entries. Repaints are requested by re-publishing the unchanged footer status, and each cached frame component reads the live view model on every render.
+- Live repaints are throttled by `liveFrameUpdateIntervalMs`; a settled frame paints once and then ignores child events.
 - A future move to native component grouping would require reopening this decision and accepting private Pi seams.

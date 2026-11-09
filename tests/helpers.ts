@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
+import type { RepaintClock } from "../src/live-view.ts";
 import type { ChildEvent } from "../src/sessions.ts";
 
 /** A throwaway directory tree for filesystem tests. */
@@ -79,6 +80,63 @@ export function ticketMarkdown(options: {
   const title = options.title ?? "# 01: Example ticket";
   const status = options.status ?? "Status: ready-for-agent";
   return [title, "", status, "", options.body ?? "Do the thing.", ""].join("\n");
+}
+
+/** A manual clock with controllable scheduled callbacks. */
+export interface FakeClock {
+  /** The clock seam handed to a throttled repainter. */
+  readonly clock: RepaintClock;
+  now(): number;
+  /** Move time forward, running due callbacks in order. */
+  advance(ms: number): void;
+  /** Number of callbacks still scheduled. */
+  readonly pending: number;
+}
+
+export function createFakeClock(start = 0): FakeClock {
+  let current = start;
+  let nextId = 1;
+  const timers = new Map<number, { at: number; callback: () => void }>();
+
+  const clock: RepaintClock = {
+    now: () => current,
+    schedule(callback, delayMs) {
+      const id = nextId;
+      nextId += 1;
+      timers.set(id, { at: current + Math.max(0, delayMs), callback });
+      return () => {
+        timers.delete(id);
+      };
+    },
+  };
+
+  return {
+    clock,
+    now: () => current,
+    advance(ms) {
+      const target = current + ms;
+      for (;;) {
+        let dueId: number | undefined;
+        let dueAt = Number.POSITIVE_INFINITY;
+        for (const [id, timer] of timers) {
+          if (timer.at <= target && timer.at < dueAt) {
+            dueId = id;
+            dueAt = timer.at;
+          }
+        }
+        if (dueId === undefined) break;
+        const timer = timers.get(dueId);
+        timers.delete(dueId);
+        if (timer === undefined) continue;
+        current = timer.at;
+        timer.callback();
+      }
+      current = target;
+    },
+    get pending() {
+      return timers.size;
+    },
+  };
 }
 
 /** A streamed assistant text delta, as the child session emits it. */

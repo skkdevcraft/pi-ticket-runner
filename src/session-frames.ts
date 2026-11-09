@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import type { CustomEntry, SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 
+import { DEFAULT_CONFIG } from "./config.ts";
+import { ThrottledRepaint, type RepaintClock } from "./live-view.ts";
 import type { ChildEvent } from "./sessions.ts";
 import {
   FRAME_ENTRY_TYPE,
@@ -26,6 +28,17 @@ export type AppendSessionFrameEntry = (
 export interface SessionFrameControllerOptions {
   readonly registry: SessionFrameRegistry;
   readonly append: AppendSessionFrameEntry;
+  readonly now?: (() => number) | undefined;
+  /** Repaint the surface that displays live frames. No-op when omitted. */
+  readonly repaint?: (() => void) | undefined;
+  /** Minimum interval between live repaints, from `liveFrameUpdateIntervalMs`. */
+  readonly liveFrameUpdateIntervalMs?: number | undefined;
+  /** Timer seam for throttled repaints; tests supply a fake clock. */
+  readonly clock?: RepaintClock | undefined;
+}
+
+/** Options for {@link SessionFrameRegistry}. */
+export interface SessionFrameRegistryOptions {
   readonly now?: (() => number) | undefined;
 }
 
@@ -135,6 +148,11 @@ export class LiveSessionFrame {
 export class SessionFrameRegistry {
   private readonly live = new Map<string, LiveSessionFrame>();
   private readonly latestEntry = new Map<string, string>();
+  private readonly now: () => number;
+
+  constructor(options: SessionFrameRegistryOptions = {}) {
+    this.now = options.now ?? (() => Date.now());
+  }
 
   /** Rebuild latest-entry knowledge from the entries of the current session. */
   rememberEntries(entries: readonly SessionEntry[]): void {
@@ -172,14 +190,16 @@ export class SessionFrameRegistry {
       // The creation entry paints the live model; the settlement entry must not
       // paint a second copy of the same frame.
       if (isTerminalFrameStatus(summary.status)) return undefined;
-      return new SessionFrameComponent(live.view(expanded, Date.now()), theme);
+      // Pi caches this component; the view source keeps the counters and
+      // elapsed time live across renders driven by a footer repaint.
+      return new SessionFrameComponent(() => live.view(expanded, this.now()), theme);
     }
 
     const latest = this.latestEntry.get(summary.frameId);
     if (latest !== undefined) {
       if (latest !== entry.id) return undefined;
       return new SessionFrameComponent(
-        summaryToFrameView(stoppedAfterReload(summary), expanded, Date.now()),
+        summaryToFrameView(stoppedAfterReload(summary), expanded, this.now()),
         theme,
       );
     }
@@ -188,7 +208,7 @@ export class SessionFrameRegistry {
     // summary only exists while its live model is available.
     if (!isTerminalFrameStatus(summary.status)) return undefined;
     return new SessionFrameComponent(
-      summaryToFrameView(summary, expanded, Date.now()),
+      summaryToFrameView(summary, expanded, this.now()),
       theme,
     );
   }
@@ -204,12 +224,20 @@ export class SessionFrameController {
   private readonly registry: SessionFrameRegistry;
   private readonly append: AppendSessionFrameEntry;
   private readonly now: () => number;
+  private readonly repaint: (() => void) | undefined;
+  private readonly repaintIntervalMs: number;
+  private readonly clock: RepaintClock | undefined;
   private active: LiveSessionFrame | undefined;
+  private repainter: ThrottledRepaint | undefined;
 
   constructor(options: SessionFrameControllerOptions) {
     this.registry = options.registry;
     this.append = options.append;
     this.now = options.now ?? (() => Date.now());
+    this.repaint = options.repaint;
+    this.repaintIntervalMs =
+      options.liveFrameUpdateIntervalMs ?? DEFAULT_CONFIG.liveFrameUpdateIntervalMs;
+    this.clock = options.clock;
   }
 
   /** Create the one frame for a child session that now exists. */
@@ -220,16 +248,23 @@ export class SessionFrameController {
     this.active = frame;
     this.registry.registerLive(frame);
     this.persist(frame);
+
+    this.repainter = this.createRepainter();
+    this.repainter?.request();
   }
 
   /** Feed one child event into the active frame's live counters. */
   childEvent(event: ChildEvent): void {
-    this.active?.childEvent(event);
+    if (this.active === undefined) return;
+    this.active.childEvent(event);
+    this.repainter?.request();
   }
 
   /** Move the active frame to the completion-gate phase without creating another. */
   gateStarted(): void {
-    this.active?.gateStarted();
+    if (this.active === undefined) return;
+    this.active.gateStarted();
+    this.repainter?.request();
   }
 
   /** Settle the active frame exactly once and persist its final summary. */
@@ -238,10 +273,17 @@ export class SessionFrameController {
     if (frame === undefined) return;
 
     this.active = undefined;
-    if (frame.isSettled) return;
+    const repainter = this.repainter;
+    this.repainter = undefined;
 
-    frame.settle(status, this.now());
-    this.persist(frame);
+    if (!frame.isSettled) {
+      frame.settle(status, this.now());
+      this.persist(frame);
+    }
+
+    // Paint the terminal status once, then make the frame static. Settlement is
+    // not throttled: it is the last paint this frame will ever ask for.
+    repainter?.settle();
   }
 
   /**
@@ -260,6 +302,16 @@ export class SessionFrameController {
     if (entryId !== undefined) {
       this.registry.rememberLatestEntry(frame.frameId, entryId);
     }
+  }
+
+  private createRepainter(): ThrottledRepaint | undefined {
+    const repaint = this.repaint;
+    if (repaint === undefined) return undefined;
+    return new ThrottledRepaint({
+      intervalMs: this.repaintIntervalMs,
+      paint: repaint,
+      ...(this.clock === undefined ? {} : { clock: this.clock }),
+    });
   }
 }
 

@@ -323,6 +323,11 @@ async function runStart(
 
   const frames = new SessionFrameController({
     registry: frameRegistry,
+    liveFrameUpdateIntervalMs: config.liveFrameUpdateIntervalMs,
+    // Custom entries have no public update-in-place API. Re-publishing the
+    // unchanged footer status requests a TUI render, and the frame renderer
+    // reads the live view model on every render.
+    repaint: () => footer.repaint(),
     append: (summary) => {
       pi.appendEntry(FRAME_ENTRY_TYPE, summary);
       return findFrameEntryId(ctx.sessionManager.getEntries(), summary.frameId);

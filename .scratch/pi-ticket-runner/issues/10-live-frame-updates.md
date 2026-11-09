@@ -4,12 +4,12 @@
 
 **Blocked by:** 09 (One inline session frame per child session)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Assistant text deltas, tool starts and ends, turn ends, and settled events feed an in-memory frame view model; the parent retains only the bounded live state the frame needs, never the full child transcript.
-- [ ] The active frame's turns, tools, errors, and elapsed time update live; tool errors increment the error count and successful completion does not.
-- [ ] The completion gate changes the painted status of the same frame to `verifying`; returning to the implementation phase or settling never creates an additional frame.
-- [ ] Live frame updates are throttled to `liveFrameUpdateIntervalMs`; changes inside the interval are coalesced, and a settled or stopped frame stops accepting further live updates.
-- [ ] Live repainting uses only public Pi seams: the renderer reads the live view model on each render, and repaint is driven through the existing footer status updates rather than private TUI internals or per-update session entries.
-- [ ] The collapsed meta always reflects the live counts and status, including while the frame is expanded; completed frames are static and never keep repainting.
-- [ ] Tests use a fake clock and fake child events to cover throttling, counter updates, the `verifying` transition on the same frame, and silence after settlement.
+- [x] Assistant text deltas, tool starts and ends, turn ends, and settled events feed an in-memory frame view model; the parent retains only the bounded live state the frame needs, never the full child transcript.
+- [x] The active frame's turns, tools, errors, and elapsed time update live; tool errors increment the error count and successful completion does not.
+- [x] The completion gate changes the painted status of the same frame to `verifying`; returning to the implementation phase or settling never creates an additional frame.
+- [x] Live frame updates are throttled to `liveFrameUpdateIntervalMs`; changes inside the interval are coalesced, and a settled or stopped frame stops accepting further live updates.
+- [x] Live repainting uses only public Pi seams: the renderer reads the live view model on each render, and repaint is driven through the existing footer status updates rather than private TUI internals or per-update session entries.
+- [x] The collapsed meta always reflects the live counts and status, including while the frame is expanded; completed frames are static and never keep repainting.
+- [x] Tests use a fake clock and fake child events to cover throttling, counter updates, the `verifying` transition on the same frame, and silence after settlement.

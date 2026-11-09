@@ -132,21 +132,31 @@ export function paintSessionFrameLine(
     .join("");
 }
 
-/** A Pi component that renders one session frame. */
+/** A view snapshot, or a source that supplies the current live view. */
+export type SessionFrameViewSource = SessionFrameView | (() => SessionFrameView);
+
+/**
+ * A Pi component that renders one session frame.
+ *
+ * Pi caches custom entry components, so a live frame passes a view *source*
+ * rather than a snapshot. Every render reads the current counters and status;
+ * a repaint of the TUI is enough to show them. Static frames pass a plain view.
+ */
 export class SessionFrameComponent implements Component {
-  private readonly view: SessionFrameView;
+  private readonly source: SessionFrameViewSource;
   private readonly theme: Theme;
 
-  constructor(view: SessionFrameView, theme: Theme) {
-    this.view = view;
+  constructor(view: SessionFrameViewSource, theme: Theme) {
+    this.source = view;
     this.theme = theme;
   }
 
   invalidate(): void {}
 
   render(width: number): string[] {
-    return renderSessionFrame(this.view, width).map((line) =>
-      paintSessionFrameLine(line, this.view.status, this.theme),
+    const view = typeof this.source === "function" ? this.source() : this.source;
+    return renderSessionFrame(view, width).map((line) =>
+      paintSessionFrameLine(line, view.status, this.theme),
     );
   }
 }
