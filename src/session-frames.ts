@@ -56,8 +56,9 @@ export interface SessionFrameTranscriptLimits {
 /**
  * The in-memory half of one live frame.
  *
- * It owns only counters, identity, and (once the frame settles) a static
- * transcript snapshot. Child transcript content is never persisted here.
+ * It owns counters, identity, a bounded streaming assistant buffer while the
+ * child runs, and (once the frame settles) a static transcript snapshot.
+ * Child transcript content is never persisted here.
  */
 export class LiveSessionFrame {
   readonly frameId: string;
