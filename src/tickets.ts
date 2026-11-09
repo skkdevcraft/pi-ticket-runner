@@ -153,15 +153,29 @@ function rejectDuplicateNumbers(candidates: readonly TicketCandidate[]): void {
   }
 }
 
-function readTicket(candidate: TicketCandidate, cwd: string): Ticket {
-  let content: string;
+/** A ticket file that can be re-read after a child session changes it. */
+export interface TicketStatusSource {
+  readonly path: string;
+  readonly filename: string;
+}
+
+/** Re-read a ticket's status from disk. Tickets are the source of truth. */
+export function readTicketStatus(ticket: TicketStatusSource): string {
+  return parseTicketStatus(readTicketContent(ticket), ticket.filename);
+}
+
+function readTicketContent(ticket: TicketStatusSource): string {
   try {
-    content = readFileSync(candidate.path, "utf8");
+    return readFileSync(ticket.path, "utf8");
   } catch (error) {
     throw new TicketRunnerError(
-      `Cannot read ticket file ${candidate.filename}: ${errorMessage(error)}`,
+      `Cannot read ticket file ${ticket.filename}: ${errorMessage(error)}`,
     );
   }
+}
+
+function readTicket(candidate: TicketCandidate, cwd: string): Ticket {
+  const content = readTicketContent(candidate);
 
   return {
     id: candidate.id,

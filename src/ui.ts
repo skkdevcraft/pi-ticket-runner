@@ -1,3 +1,4 @@
+import type { StartOutcome } from "./runner.ts";
 import { isRunnableStatus } from "./status.ts";
 import type { TicketInventory } from "./tickets.ts";
 
@@ -50,4 +51,41 @@ export function renderTicketList(
 
 function columnWidth(lengths: readonly number[]): number {
   return Math.max(0, ...lengths) + 4;
+}
+
+/** Render the outcome of `/ticket-runner start` for the main transcript. */
+export function renderStartOutcome(
+  outcome: StartOutcome,
+  folder: string,
+  runnableStatuses: readonly string[],
+): string {
+  switch (outcome.kind) {
+    case "nothing-to-run":
+      return `✅ Nothing to run — no ticket in ${folder} is ${runnableStatuses.join(", ")}.`;
+    case "success":
+      return `✅ ${outcome.ticket.id} ${outcome.ticket.title} — status now \`${outcome.status}\`.`;
+    case "gate-rejected":
+      return [
+        `⏹ ${outcome.ticket.id} ${outcome.ticket.title} is ${outcome.status.toLowerCase()}.`,
+        `Reason: ${outcome.reason || "no reason given."}`,
+        "Execution stopped.",
+      ].join("\n");
+    case "gate-malformed":
+      return [
+        `⏹ The completion gate returned an unusable answer for ${outcome.ticket.id} ${outcome.ticket.title}.`,
+        outcome.reason,
+        "",
+        "Final message:",
+        outcome.text ?? "(empty)",
+        "",
+        "Execution stopped.",
+      ].join("\n");
+    case "status-unchanged":
+      return [
+        `⏹ Ticket ${outcome.ticket.id}-${outcome.ticket.slug} reported COMPLETE,`,
+        `but its ticket file is still ${outcome.status}.`,
+        "",
+        "Execution stopped.",
+      ].join("\n");
+  }
 }

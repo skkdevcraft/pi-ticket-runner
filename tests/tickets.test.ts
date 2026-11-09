@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { loadTicketInventory, parseTicketTitle } from "../src/tickets.ts";
+import { loadTicketInventory, parseTicketTitle, readTicketStatus } from "../src/tickets.ts";
 import { TicketRunnerError } from "../src/errors.ts";
 import {
   createTempTree,
@@ -193,6 +193,31 @@ describe("loadTicketInventory: status", () => {
 
     assert.throws(
       () => loadTicketInventory({ cwd: tree.root, folder: "issues" }),
+      (error: unknown) =>
+        error instanceof TicketRunnerError && /Ticket 01-one\.md has no Status: line/.test(error.message),
+    );
+  });
+});
+
+describe("readTicketStatus", () => {
+  it("re-reads the current status from disk", () => {
+    const tree = createTempTree();
+    const path = tree.write("issues/01-one.md", ticketMarkdown({ status: "Status: ready-for-agent" }));
+    const ticket = { path, filename: "01-one.md" };
+
+    assert.equal(readTicketStatus(ticket), "ready-for-agent");
+
+    tree.write("issues/01-one.md", ticketMarkdown({ status: "**Status:** Resolved" }));
+
+    assert.equal(readTicketStatus(ticket), "resolved");
+  });
+
+  it("reports a malformed status after re-reading", () => {
+    const tree = createTempTree();
+    const path = tree.write("issues/01-one.md", "# 01: One\n\nNo status.\n");
+
+    assert.throws(
+      () => readTicketStatus({ path, filename: "01-one.md" }),
       (error: unknown) =>
         error instanceof TicketRunnerError && /Ticket 01-one\.md has no Status: line/.test(error.message),
     );

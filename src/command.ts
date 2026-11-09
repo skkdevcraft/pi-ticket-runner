@@ -1,9 +1,13 @@
+import { fileURLToPath } from "node:url";
+
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 import { loadConfig } from "./config.ts";
 import { errorMessage, TicketRunnerError } from "./errors.ts";
+import { startFirstRunnableTicket } from "./runner.ts";
+import { createTicketSession, type TicketSessionFactory } from "./sessions.ts";
 import { loadTicketInventory } from "./tickets.ts";
-import { renderTicketList } from "./ui.ts";
+import { renderStartOutcome, renderTicketList } from "./ui.ts";
 
 export const COMMAND_NAME = "ticket-runner";
 
@@ -25,6 +29,10 @@ export interface ParsedCommand {
 export interface RegisterCommandOptions {
   /** Pi agent directory, source of the global configuration file. */
   readonly agentDir: string;
+  /** This extension's entry path, filtered out of child resource loading. */
+  readonly extensionPath?: string;
+  /** Session factory, injectable so command behaviour can be tested without an LLM. */
+  readonly createSession?: TicketSessionFactory;
 }
 
 /**
@@ -127,6 +135,8 @@ async function runCommand(
         runList(pi, options, ctx, command.folder);
         return;
       case "start":
+        await runStart(pi, options, ctx, command.folder);
+        return;
       case "status":
       case "stop":
         ctx.ui.notify(
@@ -160,3 +170,37 @@ function runList(
     { triggerTurn: false },
   );
 }
+
+async function runStart(
+  pi: ExtensionAPI,
+  options: RegisterCommandOptions,
+  ctx: ExtensionCommandContext,
+  folder: string,
+): Promise<void> {
+  const { config, warnings } = loadConfig({ cwd: ctx.cwd, agentDir: options.agentDir });
+  for (const warning of warnings) ctx.ui.notify(warning, "warning");
+
+  const inventory = loadTicketInventory({ cwd: ctx.cwd, folder });
+  const outcome = await startFirstRunnableTicket({
+    cwd: ctx.cwd,
+    agentDir: options.agentDir,
+    extensionPath: options.extensionPath ?? DEFAULT_EXTENSION_PATH,
+    inventory,
+    config,
+    createSession: options.createSession ?? createTicketSession,
+    getCommands: () => pi.getCommands(),
+    ...(ctx.model === undefined ? {} : { model: ctx.model }),
+    ...(ctx.thinkingLevel === undefined ? {} : { thinkingLevel: ctx.thinkingLevel }),
+  });
+
+  pi.sendMessage(
+    {
+      customType: COMMAND_NAME,
+      content: renderStartOutcome(outcome, inventory.folderLabel, config.runnableStatuses),
+      display: true,
+    },
+    { triggerTurn: false },
+  );
+}
+
+const DEFAULT_EXTENSION_PATH = fileURLToPath(new URL("../index.ts", import.meta.url));

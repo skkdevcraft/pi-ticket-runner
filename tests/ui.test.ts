@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import type { Ticket, TicketInventory } from "../src/tickets.ts";
-import { renderTicketList } from "../src/ui.ts";
+import type { StartOutcome } from "../src/runner.ts";
+import { renderStartOutcome, renderTicketList } from "../src/ui.ts";
 
 const RUNNABLE = ["ready-for-agent"];
 
@@ -131,5 +132,88 @@ describe("renderTicketList", () => {
 
     assert.match(output, /NEXT ▶$/m);
     assert.match(output, /Executable: 1 of 1/);
+  });
+});
+
+
+describe("renderStartOutcome", () => {
+  const runnable = ["ready-for-agent"];
+
+  it("reports nothing to run with the folder and runnable status", () => {
+    const output = renderStartOutcome(
+      { kind: "nothing-to-run" },
+      ".scratch/auth/issues",
+      runnable,
+    );
+
+    assert.equal(
+      output,
+      "✅ Nothing to run — no ticket in .scratch/auth/issues is ready-for-agent.",
+    );
+  });
+
+  it("reports the status a successful ticket persisted", () => {
+    const output = renderStartOutcome(
+      {
+        kind: "success",
+        ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+        status: "resolved",
+      },
+      ".scratch/auth/issues",
+      runnable,
+    );
+
+    assert.equal(output, "✅ 03 Repository Layer — status now `resolved`.");
+  });
+
+  it("reports a gate rejection with its reason", () => {
+    const outcome: StartOutcome = {
+      kind: "gate-rejected",
+      ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+      status: "INCOMPLETE",
+      reason: "integration tests are failing",
+    };
+
+    const output = renderStartOutcome(outcome, ".scratch/auth/issues", runnable);
+
+    assert.match(output, /^⏹ 03 Repository Layer is incomplete\./);
+    assert.match(output, /Reason: integration tests are failing/);
+    assert.match(output, /Execution stopped\./);
+  });
+
+  it("reports a malformed gate answer and the raw final message", () => {
+    const outcome: StartOutcome = {
+      kind: "gate-malformed",
+      ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+      reason: "The gate returned no STATUS: line.",
+      text: "I finished everything.",
+    };
+
+    const output = renderStartOutcome(outcome, ".scratch/auth/issues", runnable);
+
+    assert.match(output, /unusable answer for 03 Repository Layer/);
+    assert.match(output, /no STATUS: line/);
+    assert.match(output, /I finished everything\./);
+    assert.match(output, /Execution stopped\./);
+  });
+
+  it("reports COMPLETE without a persisted status change", () => {
+    const outcome: StartOutcome = {
+      kind: "status-unchanged",
+      ticket: ticket("03", "repository-layer", "ready-for-agent", "Repository Layer"),
+      status: "ready-for-agent",
+    };
+
+    const output = renderStartOutcome(outcome, ".scratch/auth/issues", runnable);
+
+    assert.equal(
+      output,
+      [
+        "⏹ Ticket 03-repository-layer reported COMPLETE,",
+        "but its ticket file is still ready-for-agent.",
+        "",
+        "Execution stopped.",
+      ].join("\n"),
+    );
   });
 });
