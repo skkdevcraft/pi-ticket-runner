@@ -9,8 +9,12 @@ export interface TicketRunnerConfig {
   readonly runnableStatuses: readonly string[];
   /** Maximum child `turn_end` events during a ticket's implementation prompt. */
   readonly maxTurnsPerTicket: number;
-  /** Minimum interval between live widget renders. */
-  readonly liveWidgetUpdateIntervalMs: number;
+  /** Minimum interval between live session-frame renders. */
+  readonly liveFrameUpdateIntervalMs: number;
+  /** Maximum lines rendered in one expanded child transcript. */
+  readonly expandedTranscriptMaxLines: number;
+  /** Maximum UTF-8 bytes rendered in one expanded child transcript. */
+  readonly expandedTranscriptMaxBytes: number;
   /** Age after which an unreadable-PID lock is reported as stale. */
   readonly staleLockHours: number;
 }
@@ -18,18 +22,34 @@ export interface TicketRunnerConfig {
 export const DEFAULT_CONFIG: TicketRunnerConfig = {
   runnableStatuses: ["ready-for-agent"],
   maxTurnsPerTicket: 50,
-  liveWidgetUpdateIntervalMs: 150,
+  liveFrameUpdateIntervalMs: 150,
+  expandedTranscriptMaxLines: 1000,
+  expandedTranscriptMaxBytes: 131072,
   staleLockHours: 12,
 };
 
 const CONFIG_KEYS = [
   "runnableStatuses",
   "maxTurnsPerTicket",
-  "liveWidgetUpdateIntervalMs",
+  "liveFrameUpdateIntervalMs",
+  "expandedTranscriptMaxLines",
+  "expandedTranscriptMaxBytes",
   "staleLockHours",
 ] as const;
 
 type ConfigKey = (typeof CONFIG_KEYS)[number];
+
+/**
+ * Deprecated keys accepted as aliases for canonical settings.
+ *
+ * An alias is only applied when no file supplies its canonical key, so the
+ * frame setting always wins over the widget name regardless of file order.
+ */
+const DEPRECATED_ALIASES = {
+  liveWidgetUpdateIntervalMs: "liveFrameUpdateIntervalMs",
+} as const;
+
+type DeprecatedAlias = keyof typeof DEPRECATED_ALIASES;
 
 /** Result of loading configuration. Warnings are non-fatal. */
 export interface ConfigLoadResult {
@@ -61,6 +81,9 @@ export function loadConfig(options: LoadConfigOptions): ConfigLoadResult {
     runnableStatuses: [...DEFAULT_CONFIG.runnableStatuses],
   };
 
+  let aliasIntervalMs: number | undefined;
+  let frameIntervalProvided = false;
+
   const paths = [
     join(options.agentDir, "ticket-runner.json"),
     join(options.cwd, ".pi", "ticket-runner.json"),
@@ -71,12 +94,28 @@ export function loadConfig(options: LoadConfigOptions): ConfigLoadResult {
     if (!raw) continue;
 
     for (const [key, value] of Object.entries(raw)) {
+      if (isDeprecatedAlias(key)) {
+        aliasIntervalMs = validateNonNegativeInteger(
+          value,
+          key,
+          path,
+          "a non-negative integer number of milliseconds",
+        );
+        continue;
+      }
       if (!isConfigKey(key)) {
         warnings.push(`Unknown configuration key "${key}" in ${path}.`);
         continue;
       }
+      if (key === "liveFrameUpdateIntervalMs") {
+        frameIntervalProvided = true;
+      }
       Object.assign(config, validateValue(key, value, path));
     }
+  }
+
+  if (!frameIntervalProvided && aliasIntervalMs !== undefined) {
+    config.liveFrameUpdateIntervalMs = aliasIntervalMs;
   }
 
   return { config, warnings };
@@ -110,6 +149,10 @@ function isConfigKey(key: string): key is ConfigKey {
   return (CONFIG_KEYS as readonly string[]).includes(key);
 }
 
+function isDeprecatedAlias(key: string): key is DeprecatedAlias {
+  return Object.hasOwn(DEPRECATED_ALIASES, key);
+}
+
 function validateValue(
   key: ConfigKey,
   value: unknown,
@@ -127,13 +170,31 @@ function validateValue(
           "a positive integer number of turns",
         ),
       };
-    case "liveWidgetUpdateIntervalMs":
+    case "liveFrameUpdateIntervalMs":
       return {
-        liveWidgetUpdateIntervalMs: validateNonNegativeInteger(
+        liveFrameUpdateIntervalMs: validateNonNegativeInteger(
           value,
           key,
           path,
           "a non-negative integer number of milliseconds",
+        ),
+      };
+    case "expandedTranscriptMaxLines":
+      return {
+        expandedTranscriptMaxLines: validatePositiveInteger(
+          value,
+          key,
+          path,
+          "a positive integer number of lines",
+        ),
+      };
+    case "expandedTranscriptMaxBytes":
+      return {
+        expandedTranscriptMaxBytes: validatePositiveInteger(
+          value,
+          key,
+          path,
+          "a positive integer number of bytes",
         ),
       };
     case "staleLockHours":
@@ -164,7 +225,7 @@ function validateRunnableStatuses(value: unknown, path: string): string[] {
 
 function validatePositiveInteger(
   value: unknown,
-  key: ConfigKey,
+  key: string,
   path: string,
   expectation: string,
 ): number {
@@ -176,7 +237,7 @@ function validatePositiveInteger(
 
 function validateNonNegativeInteger(
   value: unknown,
-  key: ConfigKey,
+  key: string,
   path: string,
   expectation: string,
 ): number {
@@ -188,7 +249,7 @@ function validateNonNegativeInteger(
 
 function validatePositiveNumber(
   value: unknown,
-  key: ConfigKey,
+  key: string,
   path: string,
   expectation: string,
 ): number {
@@ -198,6 +259,6 @@ function validatePositiveNumber(
   return value;
 }
 
-function invalid(path: string, key: ConfigKey, expectation: string): TicketRunnerError {
+function invalid(path: string, key: string, expectation: string): TicketRunnerError {
   return new TicketRunnerError(`Invalid configuration in ${path}: "${key}" must be ${expectation}.`);
 }

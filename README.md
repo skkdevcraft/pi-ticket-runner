@@ -211,7 +211,7 @@ Missing files are fine. Unknown keys produce a warning; invalid values stop the 
 | `expandedTranscriptMaxBytes` | `131072` | Maximum UTF-8 bytes rendered in one expanded child transcript |
 | `staleLockHours` | `12` | Age after which an unreadable-PID lock is reported as stale |
 
-`liveWidgetUpdateIntervalMs` is accepted as a deprecated alias for `liveFrameUpdateIntervalMs`.
+`liveWidgetUpdateIntervalMs` is accepted as a deprecated alias for `liveFrameUpdateIntervalMs`; when both keys are present across the global and project files, `liveFrameUpdateIntervalMs` wins.
 
 ---
 

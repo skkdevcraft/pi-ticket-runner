@@ -848,7 +848,7 @@ describe("main-session input while a run is active", () => {
 
 describe("live ticket-runner TUI", () => {
   function configureImmediateRendering(tree: TempTree): void {
-    tree.write(".pi/ticket-runner.json", JSON.stringify({ liveWidgetUpdateIntervalMs: 0 }));
+    tree.write(".pi/ticket-runner.json", JSON.stringify({ liveFrameUpdateIntervalMs: 0 }));
   }
 
   it("renders the ticket, gate phase, next ticket, terminal footer, and clears the widget", async () => {

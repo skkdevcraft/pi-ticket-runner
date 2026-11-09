@@ -4,10 +4,10 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Configuration exposes `liveFrameUpdateIntervalMs` (default 150), `expandedTranscriptMaxLines` (default 1000), and `expandedTranscriptMaxBytes` (default 131072), alongside the existing settings.
-- [ ] `liveWidgetUpdateIntervalMs` is accepted as a deprecated alias for `liveFrameUpdateIntervalMs`; when both keys are present in the merged global and project configuration, the frame key wins regardless of which file supplied the alias.
-- [ ] Invalid values for any frame or transcript setting stop the command with a descriptive error naming the key and file; unknown keys still produce warnings rather than errors.
-- [ ] The live-view code and its tests use the renamed interval setting and compile without the widget terminology leaking into new configuration names.
-- [ ] Configuration tests cover defaults, the deprecated alias, alias precedence, and invalid values for the new caps.
+- [x] Configuration exposes `liveFrameUpdateIntervalMs` (default 150), `expandedTranscriptMaxLines` (default 1000), and `expandedTranscriptMaxBytes` (default 131072), alongside the existing settings.
+- [x] `liveWidgetUpdateIntervalMs` is accepted as a deprecated alias for `liveFrameUpdateIntervalMs`; when both keys are present in the merged global and project configuration, the frame key wins regardless of which file supplied the alias.
+- [x] Invalid values for any frame or transcript setting stop the command with a descriptive error naming the key and file; unknown keys still produce warnings rather than errors.
+- [x] The live-view code and its tests use the renamed interval setting and compile without the widget terminology leaking into new configuration names.
+- [x] Configuration tests cover defaults, the deprecated alias, alias precedence, and invalid values for the new caps.

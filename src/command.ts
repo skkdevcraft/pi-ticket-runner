@@ -271,7 +271,7 @@ async function runStart(
         ctx.ui.setStatus(COMMAND_NAME, text);
       },
     },
-    intervalMs: config.liveWidgetUpdateIntervalMs,
+    intervalMs: config.liveFrameUpdateIntervalMs,
   });
   hooks.setLiveView(liveView);
 
@@ -308,8 +308,8 @@ async function runStart(
       ...(ctx.thinkingLevel === undefined ? {} : { thinkingLevel: ctx.thinkingLevel }),
     });
 
-    // The widget always clears when the run ends; the footer keeps a terminal
-    // summary until the next run or extension teardown.
+    // The live view always clears when the run ends; the footer keeps a
+    // terminal summary until the next run or extension teardown.
     if (outcome.kind === "stopped") liveView.stop(outcome.remainingRunnable);
     else if (outcome.kind === "finished") liveView.finish(outcome.remainingRunnable);
     else liveView.clear();
