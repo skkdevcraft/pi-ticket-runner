@@ -1,12 +1,19 @@
 import { fileURLToPath } from "node:url";
 
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+  InputEvent,
+  InputEventResult,
+} from "@earendil-works/pi-coding-agent";
 
 import { loadConfig } from "./config.ts";
 import { errorMessage, TicketRunnerError } from "./errors.ts";
+import { TicketLiveView } from "./live-view.ts";
 import type { RepositoryGuard, RepositoryGuardFactory } from "./repository.ts";
 import { TicketRunState } from "./run-state.ts";
-import { RunCancellation, runTickets } from "./runner.ts";
+import { RunCancellation, runTickets, type RunOutcome } from "./runner.ts";
 import { createTicketSession, type TicketSessionFactory } from "./sessions.ts";
 import { loadTicketInventory } from "./tickets.ts";
 import {
@@ -125,6 +132,7 @@ interface RunHooks {
   onGuardChange(guard: RepositoryGuard | undefined): void;
   getCancellation(): RunCancellation | undefined;
   setCancellation(cancellation: RunCancellation | undefined): void;
+  setLiveView(view: TicketLiveView | undefined): void;
 }
 
 /** Register `/ticket-runner` with Pi. */
@@ -135,15 +143,37 @@ export function registerTicketRunnerCommand(
   const state = options.state ?? new TicketRunState();
   let activeGuard: RepositoryGuard | undefined;
   let activeCancellation: RunCancellation | undefined;
+  let activeLiveView: TicketLiveView | undefined;
 
-  // Quitting or reloading Pi must abort the child and must never leave a
-  // repository locked. The run's own cleanup releases the lock again
-  // (idempotently) once the abort settles.
+  // Quitting or reloading Pi must abort the child, clear the live TUI, and
+  // never leave a repository locked. The run's own cleanup releases the lock
+  // again (idempotently) once the abort settles.
   pi.on("session_shutdown", () => {
     activeGuard?.release();
     activeGuard = undefined;
     void activeCancellation?.cancel();
     activeCancellation = undefined;
+    activeLiveView?.clear();
+  });
+
+  // The main session is otherwise idle while a child runs, so another agent
+  // could edit the same tree and race the child. Ordinary prompts are blocked;
+  // extension commands never reach this handler, and runner-injected messages
+  // arrive with source "extension" and pass through.
+  pi.on("input", (event: InputEvent, ctx: ExtensionContext): InputEventResult => {
+    if (event.source === "extension") return { action: "continue" };
+
+    const active = state.active;
+    if (active === undefined) return { action: "continue" };
+
+    const ticket = active.currentTicket;
+    const label = ticket === undefined ? "starting" : `${ticket.id} ${ticket.title}`;
+    ctx.ui.notify(
+      `A ticket run is active (${label}).\n` +
+        `Run /${COMMAND_NAME} stop before prompting the main session.`,
+      "warning",
+    );
+    return { action: "handled" };
   });
 
   pi.registerCommand(COMMAND_NAME, {
@@ -156,6 +186,9 @@ export function registerTicketRunnerCommand(
         getCancellation: () => activeCancellation,
         setCancellation: (cancellation) => {
           activeCancellation = cancellation;
+        },
+        setLiveView: (view) => {
+          activeLiveView = view;
         },
       });
     },
@@ -229,11 +262,25 @@ async function runStart(
   const inventory = loadTicketInventory({ cwd: ctx.cwd, folder });
   state.rememberFolder(folder);
 
+  const liveView = new TicketLiveView({
+    sink: {
+      setWidget: (lines) => {
+        ctx.ui.setWidget(COMMAND_NAME, lines === undefined ? undefined : [...lines]);
+      },
+      setStatus: (text) => {
+        ctx.ui.setStatus(COMMAND_NAME, text);
+      },
+    },
+    intervalMs: config.liveWidgetUpdateIntervalMs,
+  });
+  hooks.setLiveView(liveView);
+
   const cancellation = new RunCancellation();
   hooks.setCancellation(cancellation);
 
+  let outcome: RunOutcome | undefined;
   try {
-    const outcome = await runTickets({
+    outcome = await runTickets({
       cwd: ctx.cwd,
       agentDir: options.agentDir,
       extensionPath: options.extensionPath ?? DEFAULT_EXTENSION_PATH,
@@ -242,6 +289,7 @@ async function runStart(
       createSession: options.createSession ?? createTicketSession,
       getCommands: () => pi.getCommands(),
       state,
+      observer: liveView,
       allowDirty,
       cancellation,
       onGuardChange: hooks.onGuardChange,
@@ -260,6 +308,12 @@ async function runStart(
       ...(ctx.thinkingLevel === undefined ? {} : { thinkingLevel: ctx.thinkingLevel }),
     });
 
+    // The widget always clears when the run ends; the footer keeps a terminal
+    // summary until the next run or extension teardown.
+    if (outcome.kind === "stopped") liveView.stop(outcome.remainingRunnable);
+    else if (outcome.kind === "finished") liveView.finish(outcome.remainingRunnable);
+    else liveView.clear();
+
     pi.sendMessage(
       {
         customType: COMMAND_NAME,
@@ -269,10 +323,9 @@ async function runStart(
       { triggerTurn: false },
     );
   } finally {
-    // Every run exit path, including interruption and failure, clears the live
-    // widget and footer. `state.end()` inside the runner unblocks main input.
-    ctx.ui.setWidget(COMMAND_NAME, undefined);
-    ctx.ui.setStatus(COMMAND_NAME, undefined);
+    // A thrown failure still leaves a stopped footer; a shutdown clear wins
+    // because the live view ignores later updates once it is torn down.
+    if (outcome === undefined) liveView.stop();
     if (hooks.getCancellation() === cancellation) hooks.setCancellation(undefined);
   }
 }

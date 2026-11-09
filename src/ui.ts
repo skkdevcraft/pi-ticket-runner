@@ -1,7 +1,93 @@
 import type { ActiveRun } from "./run-state.ts";
 import type { RanTicket, RunOutcome, RunStop, SkippedTicket, TicketProgress } from "./runner.ts";
 import { isRunnableStatus } from "./status.ts";
-import type { TicketInventory } from "./tickets.ts";
+import type { Ticket, TicketInventory } from "./tickets.ts";
+
+/** The line advertising the only supported interruption command. */
+export const STOP_HINT = "  (/ticket-runner stop to interrupt)";
+
+/** Which part of a ticket the live widget is currently showing. */
+export type LivePhase = "running" | "gate" | "next";
+
+/** The current or most recent tool call shown in the live widget. */
+export interface ToolActivity {
+  readonly name: string;
+  readonly status: "running" | "success" | "error";
+}
+
+/** Everything the live widget needs to render one frame. */
+export interface WidgetView {
+  readonly phase: LivePhase;
+  readonly ticket: Ticket | undefined;
+  readonly next: Ticket | undefined;
+  /** Recent assistant text lines, oldest first. At most the last three render. */
+  readonly textLines: readonly string[];
+  readonly tool: ToolActivity | undefined;
+}
+
+/** Whether the footer describes a live, finished, or stopped run. */
+export type FooterOutcome = "running" | "done" | "stopped";
+
+/** Everything the footer needs to render one frame. */
+export interface FooterStatus {
+  readonly outcome: FooterOutcome;
+  readonly remainingRunnable: number;
+  readonly ticket: Ticket | undefined;
+  readonly next: Ticket | undefined;
+}
+
+/**
+ * Render the bounded live-session widget.
+ *
+ * The result is never more than six lines: one header, up to three recent
+ * assistant text lines, one current-or-most-recent tool line, and the stop
+ * hint. Between tickets the header becomes the next ticket so a long run never
+ * looks dead.
+ */
+export function renderTicketWidget(view: WidgetView, width: number): string[] {
+  if (view.phase === "next") {
+    const next = view.next === undefined ? "none" : `${view.next.id}-${view.next.slug}`;
+    return [truncateLine(`⏳ next: ${next}`, width), STOP_HINT];
+  }
+
+  const ticket = view.ticket;
+  if (ticket === undefined) return [];
+
+  const header = view.phase === "gate"
+    ? `🔎 ${ticket.id} verifying completion`
+    : `▶ ${ticket.id} ${ticket.title}`;
+
+  const lines = [truncateLine(header, width)];
+  for (const textLine of view.textLines.slice(-3)) {
+    lines.push(truncateLine(`  ${textLine}`, width));
+  }
+  if (view.tool !== undefined) {
+    lines.push(truncateLine(`  Tool: ${view.tool.name} — ${view.tool.status}`, width));
+  }
+  lines.push(STOP_HINT);
+  return lines.slice(0, 6);
+}
+
+/** Render the footer progress label for the current run state. */
+export function renderFooterStatus(status: FooterStatus): string {
+  switch (status.outcome) {
+    case "done":
+      return `🎫 done · ${status.remainingRunnable} left`;
+    case "stopped":
+      return `🎫 stopped · ${status.remainingRunnable} left`;
+    case "running": {
+      const ticket = status.ticket ?? status.next;
+      const label = ticket === undefined ? "starting" : `${ticket.id}-${ticket.slug}`;
+      return `🎫 ${status.remainingRunnable} left · ${label}`;
+    }
+  }
+}
+
+function truncateLine(line: string, width: number): string {
+  if (width <= 0 || line.length <= width) return line;
+  if (width === 1) return "…";
+  return `${line.slice(0, width - 1)}…`;
+}
 
 /**
  * Render the `/ticket-runner list` output.

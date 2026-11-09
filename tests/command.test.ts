@@ -20,7 +20,13 @@ import type {
   CreateTicketSessionOptions,
   TicketSession,
 } from "../src/sessions.ts";
-import { createTempTree, ticketMarkdown, type TempTree } from "./helpers.ts";
+import {
+  createTempTree,
+  textDelta,
+  ticketMarkdown,
+  toolStart,
+  type TempTree,
+} from "./helpers.ts";
 
 interface SentMessage {
   readonly message: Record<string, unknown>;
@@ -39,6 +45,7 @@ interface FakePi {
   readonly uiCalls: UiCall[];
   readonly registered: { readonly name?: string; readonly description?: string | undefined };
   run(args: string, cwd: string): Promise<void>;
+  input(text: string, source?: "interactive" | "rpc" | "extension"): Promise<unknown>;
   shutdown(): void;
 }
 
@@ -77,6 +84,25 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
   const registered: { name?: string; description?: string | undefined } = {};
   let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
   const shutdownHandlers: Array<() => void> = [];
+  const inputHandlers: Array<
+    (event: { type: "input"; text: string; source: string }, ctx: ExtensionCommandContext) => unknown
+  > = [];
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const uiCalls: UiCall[] = [];
+
+  const createContext = (cwd: string): ExtensionCommandContext => ({
+    cwd,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      setWidget: (key: string, value: unknown) => {
+        uiCalls.push({ method: "setWidget", key, value });
+      },
+      setStatus: (key: string, value: unknown) => {
+        uiCalls.push({ method: "setStatus", key, value });
+      },
+    },
+  }) as unknown as ExtensionCommandContext;
 
   const pi = {
     registerCommand: (name: string, options: { description?: string; handler: typeof handler }) => {
@@ -88,14 +114,16 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
       sent.push({ message, options });
     },
     getCommands: () => [...(options.commands ?? [skillCommand()])],
-    on: (event: string, listener: () => void) => {
-      if (event === "session_shutdown") shutdownHandlers.push(listener);
+    on: (event: string, listener: (...args: never[]) => void) => {
+      if (event === "session_shutdown") shutdownHandlers.push(listener as () => void);
+      if (event === "input") {
+        inputHandlers.push(
+          listener as (event: { type: "input"; text: string; source: string }, ctx: ExtensionCommandContext) => unknown,
+        );
+      }
       return () => {};
     },
   } as unknown as ExtensionAPI;
-
-  const notifications: Array<{ message: string; level: string }> = [];
-  const uiCalls: UiCall[] = [];
 
   registerTicketRunnerCommand(pi, {
     agentDir,
@@ -112,21 +140,17 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
     shutdown() {
       for (const listener of shutdownHandlers) listener();
     },
+    async input(text, source = "interactive") {
+      const ctx = createContext("/project");
+      let result: unknown;
+      for (const listener of inputHandlers) {
+        result = (await listener({ type: "input", text, source }, ctx)) ?? result;
+      }
+      return result;
+    },
     async run(args, cwd) {
       assert.ok(handler, "command handler was not registered");
-      const ctx = {
-        cwd,
-        ui: {
-          notify: (message: string, level: string) => notifications.push({ message, level }),
-          setWidget: (key: string, value: unknown) => {
-            uiCalls.push({ method: "setWidget", key, value });
-          },
-          setStatus: (key: string, value: unknown) => {
-            uiCalls.push({ method: "setStatus", key, value });
-          },
-        },
-      } as unknown as ExtensionCommandContext;
-      await handler(args, ctx);
+      await handler(args, createContext(cwd));
     },
   };
 }
@@ -317,11 +341,12 @@ interface FakeSession extends TicketSession {
   aborted: number;
   unsubscribed: number;
   lastText: string | undefined;
+  emit(event: ChildEvent): void;
 }
 
 function fakeSession(
   responses: ReadonlyArray<string | Error>,
-  onPrompt?: (prompt: string, index: number) => void | Promise<void>,
+  onPrompt?: (prompt: string, index: number, session: FakeSession) => void | Promise<void>,
 ): {
   readonly created: FakeSession[];
   readonly create: (options: CreateTicketSessionOptions) => Promise<TicketSession>;
@@ -330,6 +355,7 @@ function fakeSession(
   return {
     created,
     async create(sessionOptions) {
+      const listeners = new Set<(event: ChildEvent) => void>();
       const session: FakeSession = {
         sessionFile: `/sessions/${created.length + 1}.jsonl`,
         prompts: [],
@@ -340,7 +366,7 @@ function fakeSession(
         async prompt(text: string) {
           const index = session.prompts.length;
           session.prompts.push(text);
-          await onPrompt?.(text, index);
+          await onPrompt?.(text, index, session);
           const response = responses[index];
           if (response instanceof Error) throw response;
           session.lastText = response ?? session.lastText;
@@ -348,10 +374,15 @@ function fakeSession(
         async abort() {
           session.aborted += 1;
         },
-        subscribe(_listener: (event: ChildEvent) => void) {
+        subscribe(listener: (event: ChildEvent) => void) {
+          listeners.add(listener);
           return () => {
             session.unsubscribed += 1;
+            listeners.delete(listener);
           };
+        },
+        emit(event: ChildEvent) {
+          for (const listener of listeners) listener(event);
         },
         getLastAssistantText() {
           return session.lastText;
@@ -714,9 +745,16 @@ describe("/ticket-runner stop", () => {
     assert.equal(fake.created[0]?.unsubscribed, 1);
     assert.equal(releases, 1);
     assert.equal(readFileSync(first, "utf8"), ticketMarkdown({ title: "# 01: First" }));
-    assert.deepEqual(pi.uiCalls, [
+    const widgetFrames = pi.uiCalls.filter((call) => call.method === "setWidget");
+    assert.ok(
+      widgetFrames.some(
+        (call) => Array.isArray(call.value) && call.value.includes("▶ 01 First"),
+      ),
+      "the live widget must show the active ticket",
+    );
+    assert.deepEqual(pi.uiCalls.slice(-2), [
       { method: "setWidget", key: "ticket-runner", value: undefined },
-      { method: "setStatus", key: "ticket-runner", value: undefined },
+      { method: "setStatus", key: "ticket-runner", value: "🎫 stopped · 2 left" },
     ]);
 
     const content = pi.sent[pi.sent.length - 1]?.message.content as string;
@@ -771,6 +809,138 @@ describe("/ticket-runner stop", () => {
     const summary = restarted.sent[restarted.sent.length - 1]?.message.content as string;
     assert.match(summary, /✅ Run finished/);
     assert.match(summary, /Ran: 01 First\./);
+  });
+});
+
+describe("main-session input while a run is active", () => {
+  it("blocks ordinary prompts but passes runner-injected messages through", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
+    let pi: FakePi;
+    const results: unknown[] = [];
+    const fake = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      async (_prompt, index) => {
+        if (index !== 0) {
+          resolveTicket(tree, "01-first.md");
+          return;
+        }
+        results.push(await pi.input("please edit something"));
+        results.push(await pi.input("runner-injected", "extension"));
+      },
+    );
+    pi = createFakePi(tree.path("agent"), { createSession: fake.create });
+
+    await pi.run("start issues", tree.root);
+
+    assert.deepEqual(results, [{ action: "handled" }, { action: "continue" }]);
+    const warning = pi.notifications.find((entry) => entry.level === "warning");
+    assert.ok(warning);
+    assert.match(warning.message, /A ticket run is active \(01 First\)\./);
+    assert.match(
+      warning.message,
+      /Run \/ticket-runner stop before prompting the main session\./,
+    );
+
+    assert.deepEqual(await pi.input("the run is over now"), { action: "continue" });
+  });
+});
+
+describe("live ticket-runner TUI", () => {
+  function configureImmediateRendering(tree: TempTree): void {
+    tree.write(".pi/ticket-runner.json", JSON.stringify({ liveWidgetUpdateIntervalMs: 0 }));
+  }
+
+  it("renders the ticket, gate phase, next ticket, terminal footer, and clears the widget", async () => {
+    const tree = createTempTree();
+    configureImmediateRendering(tree);
+    tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
+    tree.write("issues/02-second.md", ticketMarkdown({ title: "# 02: Second" }));
+    const files = ["01-first.md", "02-second.md"];
+    let pi: FakePi;
+    const fake = fakeSession(
+      [
+        "implemented",
+        "STATUS: COMPLETE\nREASON: all checks pass",
+        "implemented",
+        "STATUS: COMPLETE\nREASON: all checks pass",
+      ],
+      (prompt, index, session) => {
+        if (index === 0) {
+          session.emit(textDelta("Writing src/repository.ts…"));
+          session.emit(toolStart("edit"));
+          return;
+        }
+        session.emit(textDelta("STATUS: COMPLETE\nREASON: all checks pass"));
+        const filename = files[fake.created.indexOf(session)];
+        assert.ok(filename);
+        resolveTicket(tree, filename);
+      },
+    );
+    pi = createFakePi(tree.path("agent"), { createSession: fake.create });
+
+    await pi.run("start issues", tree.root);
+
+    const widgetFrames = pi.uiCalls
+      .filter((call) => call.method === "setWidget")
+      .map((call) => call.value);
+    assert.ok(
+      widgetFrames.some((frame) => Array.isArray(frame) && frame.includes("▶ 01 First")),
+    );
+    assert.ok(
+      widgetFrames.some(
+        (frame) => Array.isArray(frame) && frame.includes("🔎 01 verifying completion"),
+      ),
+    );
+    assert.ok(
+      widgetFrames.some(
+        (frame) => Array.isArray(frame) && frame.includes("⏳ next: 02-second"),
+      ),
+    );
+    assert.ok(
+      widgetFrames.some(
+        (frame) => Array.isArray(frame) && frame.includes("  Tool: edit — running"),
+      ),
+    );
+
+    const statuses = pi.uiCalls
+      .filter((call) => call.method === "setStatus")
+      .map((call) => call.value);
+    assert.ok(statuses.includes("🎫 2 left · 01-first"));
+    assert.ok(statuses.includes("🎫 1 left · 02-second"));
+    assert.equal(statuses.at(-1), "🎫 done · 0 left");
+    assert.equal(widgetFrames.at(-1), undefined);
+  });
+
+  it("clears the widget and footer when the extension shuts down", async () => {
+    const tree = createTempTree();
+    configureImmediateRendering(tree);
+    tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
+    let pi: FakePi;
+    let callsAtShutdown: UiCall[] = [];
+    const fake = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      (_prompt, index) => {
+        if (index !== 0) {
+          resolveTicket(tree, "01-first.md");
+          return;
+        }
+        pi.shutdown();
+        callsAtShutdown = [...pi.uiCalls];
+      },
+    );
+    pi = createFakePi(tree.path("agent"), { createSession: fake.create });
+
+    await pi.run("start issues", tree.root);
+
+    assert.deepEqual(callsAtShutdown.slice(-2), [
+      { method: "setWidget", key: "ticket-runner", value: undefined },
+      { method: "setStatus", key: "ticket-runner", value: undefined },
+    ]);
+    assert.deepEqual(pi.uiCalls.slice(-2), [
+      { method: "setWidget", key: "ticket-runner", value: undefined },
+      { method: "setStatus", key: "ticket-runner", value: undefined },
+    ]);
   });
 });
 

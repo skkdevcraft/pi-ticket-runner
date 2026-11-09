@@ -27,6 +27,7 @@ import type {
   TicketSession,
 } from "../src/sessions.ts";
 import type { Ticket, TicketInventory } from "../src/tickets.ts";
+import { settled, textDelta, toolEnd, toolStart, turnEnd } from "./helpers.ts";
 
 function ticket(id: string, status: string, title = `Ticket ${id}`): Ticket {
   const slug = `ticket-${id}`;
@@ -293,6 +294,72 @@ describe("runTickets: sequential execution", () => {
         ["04", "resolved", undefined, 0],
       ],
     );
+  });
+
+  it("forwards subscribable child events and run milestones to the live observer", async () => {
+    const statuses = new Map([
+      ["01-ticket-01.md", "ready-for-agent"],
+      ["02-ticket-02.md", "ready-for-agent"],
+    ]);
+    const log: string[] = [];
+    const observer = {
+      ticketStarted(value: Ticket, remainingRunnable: number) {
+        log.push(`start:${value.id}:${remainingRunnable}`);
+      },
+      childEvent(event: ChildEvent, phase: "implementation" | "completion-gate") {
+        log.push(`event:${event.type}:${phase}`);
+      },
+      gateStarted(value: Ticket) {
+        log.push(`gate:${value.id}`);
+      },
+      betweenTickets(next: Ticket | undefined, remainingRunnable: number) {
+        log.push(`between:${next?.id ?? "none"}:${remainingRunnable}`);
+      },
+    };
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: ({ promptIndex, sessionIndex, session }) => {
+        if (promptIndex === 0) {
+          session.emit(textDelta("writing code"));
+          session.emit(toolStart("edit"));
+          session.emit(toolEnd("edit"));
+          session.emit(turnEnd());
+          session.emit(settled());
+          return;
+        }
+        session.emit(textDelta("gate output"));
+        statuses.set(
+          sessionIndex === 0 ? "01-ticket-01.md" : "02-ticket-02.md",
+          "resolved",
+        );
+      },
+    });
+
+    const outcome = await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent"), ticket("02", "ready-for-agent")),
+        createSession: fake.create,
+        readStatus: statusReader(statuses),
+        observer,
+      }),
+    );
+
+    assert.equal(outcome.kind, "finished");
+    assert.deepEqual(log.slice(0, 9), [
+      "start:01:2",
+      "event:message_update:implementation",
+      "event:tool_execution_start:implementation",
+      "event:tool_execution_end:implementation",
+      "event:turn_end:implementation",
+      "event:agent_settled:implementation",
+      "gate:01",
+      "event:message_update:completion-gate",
+      "between:02:1",
+    ]);
+    assert.ok(log.includes("start:02:1"));
+    assert.equal(log.at(-1), "between:none:0");
+    assert.ok(log.indexOf("gate:01") < log.indexOf("event:message_update:completion-gate"));
+    assert.ok(log.indexOf("between:02:1") < log.indexOf("start:02:1"));
   });
 
   it("creates a fresh session for every ticket with no inherited conversation", async () => {
@@ -888,10 +955,6 @@ describe("runTickets: stop conditions", () => {
 });
 
 describe("runTickets: turn limit", () => {
-  function turnEnd(): ChildEvent {
-    return { type: "turn_end" } as unknown as ChildEvent;
-  }
-
   it("aborts the child, skips the gate, and stops at the turn limit", async () => {
     const fake = fakeSessionFactory({
       responses: ["implemented", COMPLETE],

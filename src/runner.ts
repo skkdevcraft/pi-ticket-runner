@@ -8,6 +8,7 @@ import {
   parseGateResult,
   type GateStatus,
 } from "./gate.ts";
+import type { RunObserver } from "./live-view.ts";
 import type { TicketRunState } from "./run-state.ts";
 import {
   openRepositoryGuard,
@@ -210,6 +211,8 @@ export interface RunTicketsOptions {
   readonly onProgress?: ((progress: TicketProgress) => void) | undefined;
   /** In-memory state observable by `/ticket-runner status`. */
   readonly state?: TicketRunState | undefined;
+  /** Live-view port receiving child events and run milestones. */
+  readonly observer?: RunObserver | undefined;
   /**
    * Cancellation flag and active-child abort, shared with
    * `/ticket-runner stop`. Defaults to a cancellation that is never requested.
@@ -301,6 +304,7 @@ export async function runTickets(options: RunTicketsOptions): Promise<RunOutcome
 
       const remainingRunnable = countRunnable(statuses, runnableStatuses);
       options.state?.setPosition(ticket, remainingRunnable);
+      options.observer?.ticketStarted(ticket, remainingRunnable);
 
       let session: TicketSession;
       try {
@@ -374,6 +378,7 @@ export async function runTickets(options: RunTicketsOptions): Promise<RunOutcome
       const next = firstRunnable(options.inventory.tickets, statuses, runnableStatuses);
       const remaining = countRunnable(statuses, runnableStatuses);
       options.state?.setPosition(next, remaining);
+      options.observer?.betweenTickets(next, remaining);
       options.onProgress?.({
         ticket,
         status: attempt.status,
@@ -421,12 +426,14 @@ async function runTicketAttempt(
   cancellation: RunCancellation,
 ): Promise<TicketAttempt> {
   const maxTurns = options.config.maxTurnsPerTicket;
+  const observer = options.observer;
   let phase: "implementation" | "completion-gate" = "implementation";
   let turns = 0;
   let turnLimitReached = false;
   let abortPromise: Promise<void> | undefined;
 
   const unsubscribe = session.subscribe((event) => {
+    observer?.childEvent(event, phase);
     if (phase !== "implementation" || event.type !== "turn_end") return;
     if (turnLimitReached) return;
 
@@ -470,6 +477,7 @@ async function runTicketAttempt(
     }
 
     phase = "completion-gate";
+    observer?.gateStarted(ticket);
     try {
       await session.prompt(
         buildCompletionGatePrompt(

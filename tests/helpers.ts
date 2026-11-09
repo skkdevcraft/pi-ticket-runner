@@ -3,6 +3,8 @@ import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
+import type { ChildEvent } from "../src/sessions.ts";
+
 /** A throwaway directory tree for filesystem tests. */
 export interface TempTree {
   readonly root: string;
@@ -77,4 +79,48 @@ export function ticketMarkdown(options: {
   const title = options.title ?? "# 01: Example ticket";
   const status = options.status ?? "Status: ready-for-agent";
   return [title, "", status, "", options.body ?? "Do the thing.", ""].join("\n");
+}
+
+/** A streamed assistant text delta, as the child session emits it. */
+export function textDelta(delta: string): ChildEvent {
+  return {
+    type: "message_update",
+    message: { role: "assistant", content: [] },
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+  } as unknown as ChildEvent;
+}
+
+/** A tool starting, as the child session emits it. */
+export function toolStart(name: string): ChildEvent {
+  return {
+    type: "tool_execution_start",
+    toolCallId: "call-1",
+    toolName: name,
+    args: {},
+  } as unknown as ChildEvent;
+}
+
+/** A tool finishing, as the child session emits it. */
+export function toolEnd(name: string, isError = false): ChildEvent {
+  return {
+    type: "tool_execution_end",
+    toolCallId: "call-1",
+    toolName: name,
+    result: {},
+    isError,
+  } as unknown as ChildEvent;
+}
+
+/** One completed child turn. */
+export function turnEnd(): ChildEvent {
+  return {
+    type: "turn_end",
+    message: { role: "assistant", content: [] },
+    toolResults: [],
+  } as unknown as ChildEvent;
+}
+
+/** A settled child run. */
+export function settled(): ChildEvent {
+  return { type: "agent_settled", aborted: false };
 }
