@@ -1,0 +1,27 @@
+{
+  "name": "pi-ticket-runner",
+  "version": "0.1.0",
+  "description": "A Pi extension that runs Matt Pocock-skill tickets one by one, each in its own fresh session — so your main context never overflows.",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/"
+  }
+}
