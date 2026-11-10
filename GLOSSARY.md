@@ -32,6 +32,10 @@ _Avoid_: preview, header
 The bounded, read-only view of a child session's messages shown when a session frame is open.
 _Avoid_: child log, sub-transcript
 
+**Context usage**:
+A child session's estimated context tokens as a percentage of its model's context window, shown in the collapsed summary.
+_Avoid_: context size, context percent, token usage
+
 **Settled**:
 The point at which a child session will not continue automatically and its frame stops live updates.
 _Avoid_: completed (for the child session), finished
