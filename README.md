@@ -6,6 +6,34 @@ The main session keeps only the ticket inventory, progress, and status. Implemen
 
 ---
 
+## What a run looks like
+
+Every ticket gets exactly one collapsible frame in the main transcript. Collapsed, it is a two-line summary that updates live:
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ ▸ ● 03 Repository layer · Running                                                                            │
+│   12 turns • 34 tools • 0 errors • 42.1%/200k • 24m 40s • claude-sonnet-4-5 • (ctrl+o) • /ticket-runner stop │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+When the ticket settles, the status word and the counters freeze and the `stop` hint disappears:
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ ▸ ● 03 Repository layer · Done                                                                               │
+│   18 turns • 61 tools • 0 errors • 42.1%/200k • 31m 42s • claude-sonnet-4-5 • (ctrl+o)                       │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Reading the header line: `▸`/`▾` shows whether the frame is collapsed or expanded, `●` is coloured by status (`Running`, `Verifying`, `Done`, `Stopped`, `Failed`), then the ticket number, its title, and the status word.
+
+Reading the meta line, left to right: turns, tool calls, errors, context usage (the child's estimated tokens as a share of its model window, `?/200k` while unknown, coloured `warning` above 70% and `error` above 90%), elapsed time, model, and `(ctrl+o)`. Only a live frame appends `/ticket-runner stop`.
+
+Press `Ctrl+O` to expand every frame to its child transcript and again to collapse. Expanded frames also show the `Session <id>` prefix and a separating rule above the transcript. Frames are TUI-only and never enter the main session's model context.
+
+---
+
 ## What it does
 
 - Discovers numbered Markdown tickets in a folder you supply.
@@ -17,6 +45,10 @@ The main session keeps only the ticket inventory, progress, and status. Implemen
 - Stops conservatively on errors, failed gates, turn limits, interrupts, or mid-run Git changes.
 
 **Not** a general sub-agent framework, ticket generator, or ticket tracker. Ticket generation and implementation methodology stay with the [Matt Pocock skills](https://github.com/mattpocock/skills).
+
+### Relationship to the `implement-spec` skill
+
+This extension is designed as a replacement for the `implement-spec` skill, which relies on configured sub-agents to implement a spec. `pi-ticket-runner` implements a **folder of tickets**, each in its own separate session, **without** needing an installed or configured sub-agent extension — Pi's own session API is enough.
 
 ---
 
@@ -128,7 +160,7 @@ While a run is active, ordinary prompts to the main session are blocked (run `/t
 
 ### Session frames
 
-Each child session appears in the main transcript as one bordered, collapsible frame. Collapsed, it shows the ticket, status, turns, tools, errors, context usage, elapsed time, model, and `(ctrl+o)`. Context usage is the child's estimated context tokens as a percentage of its model's context window, formatted like Pi's footer (`42.1%/200k`, or `?/200k` while the count is unknown) and coloured `warning` above 70% and `error` above 90%; the segment is omitted when the model reports no context window. The active frame samples it at message and tool boundaries and keeps the last known value once settled. Press `Ctrl+O` to expand all frames to the child transcript; press it again to collapse them. The active frame updates live. Expanded transcripts are capped at 1,000 lines or 128 KB per frame, with the full history always available in `/resume`. Frames are TUI-only and never enter the main session's model context.
+Each child session appears in the main transcript as one bordered, collapsible frame (see [What a run looks like](#what-a-run-looks-like)). Context usage is sampled at message and tool boundaries rather than on every live repaint, and the last known value is kept once the frame settles. Expand or collapse all frames with `Ctrl+O`; the active frame updates live while expanded. Expanded transcripts are capped at 1,000 lines or 128 KB per frame, with the full history always available in `/resume`.
 
 ---
 
