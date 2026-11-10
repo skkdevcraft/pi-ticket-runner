@@ -4,7 +4,7 @@
 
 **Blocked by:** none
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] The collapsed summary's meta line shows context usage between the `errors` counter and the elapsed time: `12 turns • 8 tools • 0 errors • 42.1%/200k • 3m 07s • <model> • (ctrl+o)`.
 - [ ] The percentage uses one decimal and the window is abbreviated with the same `k`/`M` convention Pi's footer uses (`200k`, `1M`).

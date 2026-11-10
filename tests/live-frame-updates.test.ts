@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import type { CustomEntry, Theme } from "@earendil-works/pi-coding-agent";
+import type { ContextUsage, CustomEntry, Theme } from "@earendil-works/pi-coding-agent";
 
 import { RunFooterView, ThrottledRepaint, type RunFooterSink } from "../src/live-view.ts";
 import {
@@ -13,6 +13,7 @@ import { SessionFrameController, SessionFrameRegistry } from "../src/session-fra
 import type { Ticket } from "../src/tickets.ts";
 import {
   createFakeClock,
+  messageEnd,
   settled,
   textDelta,
   toolEnd,
@@ -351,5 +352,182 @@ describe("live frame updates", () => {
     assert.ok(creation);
     const rendered = liveLines(registry, creation).join("\n");
     assert.match(rendered, /1m 05s/);
+  });
+});
+
+describe("live frame context usage", () => {
+  interface ContextFixture {
+    readonly clock: FakeClock;
+    readonly registry: SessionFrameRegistry;
+    readonly controller: SessionFrameController;
+    readonly appended: SessionFrameSummary[];
+    readonly usage: { value: ContextUsage | undefined; fails: boolean };
+    readonly reads: () => number;
+    readonly child: () => {
+      sessionFile: string;
+      model: string;
+      contextUsage: () => ContextUsage | undefined;
+    };
+  }
+
+  function contextFixture(initial?: ContextUsage): ContextFixture {
+    const clock = createFakeClock(1_000);
+    const registry = new SessionFrameRegistry({ now: clock.now });
+    const appended: SessionFrameSummary[] = [];
+    const usage: { value: ContextUsage | undefined; fails: boolean } = {
+      value: initial ?? { tokens: 84_200, contextWindow: 200_000, percent: 42.1 },
+      fails: false,
+    };
+    let reads = 0;
+
+    const controller = new SessionFrameController({
+      registry,
+      now: clock.now,
+      clock: clock.clock,
+      append: (summary) => {
+        appended.push(summary);
+        return `entry-${appended.length}`;
+      },
+    });
+
+    return {
+      clock,
+      registry,
+      controller,
+      appended,
+      usage,
+      reads: () => reads,
+      child: () => ({
+        sessionFile: SESSION_FILE,
+        model: "gpt-5",
+        contextUsage: () => {
+          reads += 1;
+          if (usage.fails) throw new Error("context usage unavailable");
+          return usage.value;
+        },
+      }),
+    };
+  }
+
+  function meta(fixture: ContextFixture): string {
+    const creation = fixture.appended[0];
+    assert.ok(creation);
+    return liveLines(fixture.registry, creation)[2] ?? "";
+  }
+
+  it("samples context usage when the frame is created and paints it immediately", () => {
+    const fixture = contextFixture();
+
+    fixture.controller.start(ticket(), fixture.child());
+
+    assert.equal(fixture.reads(), 1);
+    assert.match(meta(fixture), /0 errors • 42\.1%\/200k • 0s/);
+  });
+
+  it("refreshes only at assistant-message end, tool end, gate start, and settlement", () => {
+    const fixture = contextFixture();
+    fixture.controller.start(ticket(), fixture.child());
+
+    const creation = fixture.appended[0];
+    assert.ok(creation);
+    const component = fixture.registry.renderEntry(
+      frameEntry("entry-1", creation),
+      false,
+      identityTheme,
+    );
+    assert.ok(component instanceof SessionFrameComponent);
+    component.render(160);
+    component.render(160);
+    fixture.controller.childEvent(textDelta("streaming"));
+    fixture.controller.childEvent(messageEnd({ role: "user", content: "prompt" }));
+    assert.equal(fixture.reads(), 1, "streaming and user messages never resample");
+
+    fixture.clock.advance(200);
+    fixture.usage.value = { tokens: 100_000, contextWindow: 200_000, percent: 50 };
+    fixture.controller.childEvent(messageEnd({ role: "assistant", content: [] }));
+    assert.equal(fixture.reads(), 2);
+    assert.match(meta(fixture), /50\.0%\/200k/);
+
+    fixture.clock.advance(200);
+    fixture.usage.value = { tokens: 140_000, contextWindow: 200_000, percent: 70 };
+    fixture.controller.childEvent(toolStart("edit"));
+    assert.equal(fixture.reads(), 2, "a tool starting is not a boundary");
+    fixture.controller.childEvent(toolEnd("edit"));
+    assert.equal(fixture.reads(), 3);
+    assert.match(meta(fixture), /70\.0%\/200k/);
+
+    fixture.clock.advance(200);
+    fixture.usage.value = { tokens: 90_000, contextWindow: 200_000, percent: 45 };
+    fixture.controller.gateStarted();
+    assert.equal(fixture.reads(), 4);
+    assert.match(meta(fixture), /45\.0%\/200k/);
+
+    fixture.controller.settle("done");
+    assert.equal(fixture.reads(), 5);
+  });
+
+  it("keeps the line's shape with ?/window when the count becomes unknown", () => {
+    const fixture = contextFixture();
+    fixture.controller.start(ticket(), fixture.child());
+    assert.match(meta(fixture), /42\.1%\/200k/);
+
+    fixture.clock.advance(200);
+    fixture.usage.value = { tokens: null, contextWindow: 200_000, percent: null };
+    fixture.controller.childEvent(messageEnd({ role: "assistant", content: [] }));
+
+    assert.match(meta(fixture), /0 errors • \?\/200k • 0s/);
+  });
+
+  it("keeps the last known value when a read fails, without counting an error", () => {
+    const fixture = contextFixture();
+    fixture.controller.start(ticket(), fixture.child());
+
+    fixture.usage.fails = true;
+    fixture.controller.childEvent(toolStart("edit"));
+    fixture.controller.childEvent(toolEnd("edit"));
+    fixture.controller.gateStarted();
+
+    assert.match(meta(fixture), /0 errors • 42\.1%\/200k/);
+    fixture.controller.settle("failed");
+    assert.equal(fixture.appended.at(-1)?.errors, 0);
+    assert.deepEqual(fixture.appended.at(-1)?.contextUsage, {
+      percent: 42.1,
+      contextWindow: 200_000,
+    });
+  });
+
+  it("omits the segment and persists nothing when the model has no context window", () => {
+    const fixture = contextFixture({ tokens: 0, contextWindow: 0, percent: 0 });
+    fixture.controller.start(ticket(), fixture.child());
+    fixture.controller.settle("done");
+
+    assert.match(meta(fixture), /0 errors • 0s/);
+    assert.doesNotMatch(meta(fixture), /%/);
+    assert.equal(fixture.appended[0]?.contextUsage, undefined);
+    assert.equal(fixture.appended[1]?.contextUsage, undefined);
+  });
+
+  it("persists the settled snapshot and renders it after reload", () => {
+    const fixture = contextFixture();
+    fixture.controller.start(ticket(), fixture.child());
+
+    fixture.clock.advance(200);
+    fixture.usage.value = { tokens: 164_000, contextWindow: 200_000, percent: 82 };
+    fixture.controller.childEvent(messageEnd({ role: "assistant", content: [] }));
+    fixture.controller.settle("done");
+
+    const settlement = fixture.appended[1];
+    assert.ok(settlement);
+    assert.deepEqual(settlement.contextUsage, { percent: 82, contextWindow: 200_000 });
+    assert.doesNotMatch(JSON.stringify(settlement), /tokens/);
+
+    fixture.registry.clearLive();
+    const component = fixture.registry.renderEntry(
+      frameEntry("entry-2", settlement),
+      false,
+      identityTheme,
+    );
+    assert.ok(component instanceof SessionFrameComponent);
+    assert.match(component.render(160)[2] ?? "", /0 errors • 82\.0%\/200k/);
   });
 });

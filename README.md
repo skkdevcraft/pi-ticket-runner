@@ -128,7 +128,7 @@ While a run is active, ordinary prompts to the main session are blocked (run `/t
 
 ### Session frames
 
-Each child session appears in the main transcript as one bordered, collapsible frame. Collapsed, it shows the ticket, status, turns, tools, errors, elapsed time, model, and `(ctrl+o)`. Press `Ctrl+O` to expand all frames to the child transcript; press it again to collapse them. The active frame updates live. Expanded transcripts are capped at 1,000 lines or 128 KB per frame, with the full history always available in `/resume`. Frames are TUI-only and never enter the main session's model context.
+Each child session appears in the main transcript as one bordered, collapsible frame. Collapsed, it shows the ticket, status, turns, tools, errors, context usage, elapsed time, model, and `(ctrl+o)`. Context usage is the child's estimated context tokens as a percentage of its model's context window, formatted like Pi's footer (`42.1%/200k`, or `?/200k` while the count is unknown) and coloured `warning` above 70% and `error` above 90%; the segment is omitted when the model reports no context window. The active frame samples it at message and tool boundaries and keeps the last known value once settled. Press `Ctrl+O` to expand all frames to the child transcript; press it again to collapse them. The active frame updates live. Expanded transcripts are capped at 1,000 lines or 128 KB per frame, with the full history always available in `/resume`. Frames are TUI-only and never enter the main session's model context.
 
 ---
 

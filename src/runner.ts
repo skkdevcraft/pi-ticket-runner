@@ -336,6 +336,7 @@ export async function runTickets(options: RunTicketsOptions): Promise<RunOutcome
         sessionFile: session.sessionFile,
         model: options.model?.id,
         transcript: () => session.getTranscript(),
+        contextUsage: () => session.getContextUsage(),
       });
 
       // A stop that landed while the session was being created must abort and

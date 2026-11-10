@@ -57,6 +57,7 @@ function view(overrides: Partial<SessionFrameView> = {}): SessionFrameView {
     transcript: [],
     expandedTranscriptMaxLines: 1_000,
     expandedTranscriptMaxBytes: 131_072,
+    contextUsage: undefined,
     now: 12_000,
     ...overrides,
   };
@@ -120,6 +121,11 @@ function renderedLines(component: unknown, width = 120): string[] {
   return component.render(width);
 }
 
+/** Strip the fake theme's `[colour]...[ /]` markers from a painted line. */
+function unstyled(painted: string): string {
+  return painted.replace(/\[[^\]]*\]/g, "");
+}
+
 describe("renderSessionFrame", () => {
   it("draws a full-width border and a collapsed header and meta line", () => {
     const lines = sessionFrameText(renderSessionFrame(view(), 120));
@@ -176,6 +182,32 @@ describe("renderSessionFrame", () => {
     assert.ok(calls.some((call) => call.colour === "error" && call.text === "●"));
     assert.ok(calls.some((call) => call.colour === "dim" && call.text.includes("3 turns")));
     assert.ok(calls.some((call) => call.colour === "borderMuted" && call.text === " │"));
+  });
+
+  it("colours context usage dim below 70%, warning above 70%, and error above 90%", () => {
+    const expected: Array<[number | null, string]> = [
+      [42.1, "dim"],
+      [70, "dim"],
+      [70.1, "warning"],
+      [90, "warning"],
+      [90.1, "error"],
+      [null, "dim"],
+    ];
+
+    for (const [percent, colour] of expected) {
+      const { theme, calls } = fakeTheme();
+      const lines = renderSessionFrame(
+        view({ contextUsage: { percent, contextWindow: 200_000 } }),
+        160,
+      );
+      lines.forEach((line) => paintSessionFrameLine(line, "running", theme));
+
+      const label = percent === null ? "?" : `${percent}%`;
+      assert.ok(
+        calls.some((call) => call.colour === colour && call.text.includes("200k")),
+        `${label} should paint context usage with ${colour}`,
+      );
+    }
   });
 
   it("colours each status dot according to the frame status", () => {
@@ -288,6 +320,54 @@ describe("renderSessionFrame", () => {
   });
 });
 
+describe("context usage in the collapsed summary", () => {
+  const usage = { percent: 42.1, contextWindow: 200_000 };
+
+  it("shows the percentage and window between the errors counter and the elapsed time", () => {
+    const meta = sessionFrameText(renderSessionFrame(view({ contextUsage: usage }), 160))[2] ?? "";
+
+    assert.match(meta, /0 errors • 42\.1%\/200k • 12s/);
+  });
+
+  it("abbreviates the window the way Pi's footer does", () => {
+    const abbreviated = (contextWindow: number): string =>
+      sessionFrameText(
+        renderSessionFrame(view({ contextUsage: { percent: 1, contextWindow } }), 160),
+      )[2] ?? "";
+
+    assert.match(abbreviated(200_000), /1\.0%\/200k/);
+    assert.match(abbreviated(1_000_000), /1\.0%\/1M/);
+    assert.match(abbreviated(999_000), /1\.0%\/999k/);
+  });
+
+  it("keeps the line's shape with a question mark when tokens are unknown", () => {
+    const meta = sessionFrameText(
+      renderSessionFrame(view({ contextUsage: { percent: null, contextWindow: 200_000 } }), 160),
+    )[2] ?? "";
+
+    assert.match(meta, /0 errors • \?\/200k • 12s/);
+    assert.doesNotMatch(meta, /\?%/);
+  });
+
+  it("omits the segment when the child's model has no context window", () => {
+    const meta = sessionFrameText(renderSessionFrame(view({ contextUsage: undefined }), 160))[2] ?? "";
+
+    assert.match(meta, /0 errors • 12s/);
+    assert.doesNotMatch(meta, /%/);
+    assert.doesNotMatch(meta, /\?\//);
+  });
+
+  it("keeps context usage when higher-value counters still fit a narrow line", () => {
+    const lines = sessionFrameText(renderSessionFrame(view({ contextUsage: usage }), 48));
+    const meta = lines[2] ?? "";
+
+    assert.match(meta, /3 turns • 2 tools • 0 errors • 42\.1%\/200k/);
+    assert.match(meta, /…/);
+    assert.doesNotMatch(meta, /12s/);
+    for (const line of lines) assert.equal(line.length, 48);
+  });
+});
+
 describe("session frame summaries", () => {
   it("keeps only identity, counters, model, status, and timestamps", () => {
     const parsed = readSessionFrameSummary(summary());
@@ -313,6 +393,44 @@ describe("session frame summaries", () => {
     assert.equal(readSessionFrameSummary({ ...summary(), status: "running-ish" }), undefined);
     assert.equal(readSessionFrameSummary({ ...summary(), turns: -1 }), undefined);
     assert.equal(readSessionFrameSummary({ ...summary(), frameId: "" }), undefined);
+  });
+
+  it("keeps a context usage value through a persisted round trip", () => {
+    const contextUsage = { percent: 42.1, contextWindow: 200_000 };
+
+    const parsed = readSessionFrameSummary({ ...summary(), contextUsage });
+
+    assert.deepEqual(parsed?.contextUsage, contextUsage);
+    assert.deepEqual(summaryToFrameView(parsed ?? summary(), false, 0).contextUsage, contextUsage);
+    assert.deepEqual(Object.keys(parsed ?? {}).sort().includes("contextUsage"), true);
+  });
+
+  it("accepts an unknown token count and a window-only value", () => {
+    const unknown = readSessionFrameSummary({
+      ...summary(),
+      contextUsage: { percent: null, contextWindow: 200_000 },
+    });
+    assert.deepEqual(unknown?.contextUsage, { percent: null, contextWindow: 200_000 });
+  });
+
+  it("rejects a malformed context usage without discarding the rest of the summary", () => {
+    const malformed: unknown[] = [
+      "42.1%/200k",
+      { percent: "42.1", contextWindow: 200_000 },
+      { percent: 42.1, contextWindow: "200k" },
+      { percent: 42.1, contextWindow: 0 },
+      { percent: 42.1 },
+      { percent: 42.1, contextWindow: Number.NaN },
+      { percent: 42.1, contextWindow: -1 },
+    ];
+
+    for (const contextUsage of malformed) {
+      const parsed = readSessionFrameSummary({ ...summary(), contextUsage });
+      assert.notEqual(parsed, undefined, JSON.stringify(contextUsage));
+      assert.equal(parsed?.contextUsage, undefined, JSON.stringify(contextUsage));
+      assert.equal(parsed?.ticketId, "03", JSON.stringify(contextUsage));
+      assert.equal(parsed?.status, "done", JSON.stringify(contextUsage));
+    }
   });
 
   it("converts a summary into a static view", () => {
@@ -396,6 +514,30 @@ describe("frame visibility", () => {
       renderedLines(registry.renderEntry(settlementEntry, false, theme))[1] ?? "",
       /· Done/,
     );
+  });
+
+  it("renders a reloaded summary with its recorded context usage", () => {
+    const registry = new SessionFrameRegistry();
+    const entry = frameEntry(
+      "entry-2",
+      summary({ contextUsage: { percent: 42.1, contextWindow: 200_000 } }),
+    );
+    registry.rememberEntries([entry]);
+    const { theme } = fakeTheme();
+
+    const meta = unstyled(renderedLines(registry.renderEntry(entry, false, theme))[2] ?? "");
+    assert.match(meta, /0 errors • 42\.1%\/200k/);
+  });
+
+  it("renders a summary written before context usage existed", () => {
+    const registry = new SessionFrameRegistry();
+    const entry = frameEntry("entry-2", summary());
+    registry.rememberEntries([entry]);
+    const { theme } = fakeTheme();
+
+    const meta = unstyled(renderedLines(registry.renderEntry(entry, false, theme))[2] ?? "");
+    assert.match(meta, /0 errors • 12s/);
+    assert.doesNotMatch(meta, /%/);
   });
 
   it("never leaves a reloaded non-terminal summary reporting running", () => {

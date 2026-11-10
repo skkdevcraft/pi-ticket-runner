@@ -1,6 +1,6 @@
 import { basename } from "node:path";
 
-import { renderDiff, type Theme } from "@earendil-works/pi-coding-agent";
+import { renderDiff, type ContextUsage, type Theme } from "@earendil-works/pi-coding-agent";
 import { Markdown, truncateToWidth, type Component, type MarkdownTheme } from "@earendil-works/pi-tui";
 
 import { DEFAULT_CONFIG } from "./config.ts";
@@ -28,6 +28,17 @@ export function isTerminalFrameStatus(status: SessionFrameStatus): boolean {
 }
 
 /**
+ * One frame's context usage, limited to what the collapsed summary shows.
+ *
+ * Token counts are deliberately absent: the meta line never displays them.
+ */
+export interface SessionFrameContextUsage {
+  /** Percentage of the window, or null while the count is unknown. */
+  readonly percent: number | null;
+  readonly contextWindow: number;
+}
+
+/**
  * The small, durable summary persisted for a frame.
  *
  * It deliberately contains counters and identity only. Transcript content stays
@@ -45,6 +56,8 @@ export interface SessionFrameSummary {
   readonly errors: number;
   readonly startedAt: string;
   readonly endedAt?: string;
+  /** Absent when the child's model reports no context window. */
+  readonly contextUsage?: SessionFrameContextUsage | undefined;
 }
 
 /** Child-session facts a frame records when it is created. */
@@ -58,6 +71,12 @@ export interface SessionFrameChild {
    * the child session entries.
    */
   readonly transcript?: (() => readonly TranscriptEntry[]) | undefined;
+  /**
+   * Read the child's current context usage.
+   *
+   * Sampled at boundaries only, never on every live repaint.
+   */
+  readonly contextUsage?: (() => ContextUsage | undefined) | undefined;
 }
 
 /** Everything the pure frame renderer needs. */
@@ -80,12 +99,14 @@ export interface SessionFrameView {
   readonly transcript: readonly TranscriptEntry[];
   readonly expandedTranscriptMaxLines: number;
   readonly expandedTranscriptMaxBytes: number;
+  /** Absent when the child's model reports no context window. */
+  readonly contextUsage: SessionFrameContextUsage | undefined;
   /** Epoch milliseconds used for the live elapsed time. */
   readonly now: number;
 }
 
 /** A colour role inside one rendered frame line. */
-export type SessionFrameTone = "border" | "status" | "dim" | "error";
+export type SessionFrameTone = "border" | "status" | "dim" | "warning" | "error";
 
 /** One coloured span of a frame line. */
 export interface SessionFrameSegment {
@@ -178,6 +199,8 @@ export function paintSessionFrameLine(
           return theme.fg(statusColour(status), segment.text);
         case "dim":
           return theme.fg("dim", segment.text);
+        case "warning":
+          return theme.fg("warning", segment.text);
         case "error":
           return theme.fg("error", segment.text);
         default:
@@ -286,6 +309,7 @@ export function summaryToFrameView(
     transcript: [],
     expandedTranscriptMaxLines: limits.maxLines ?? DEFAULT_CONFIG.expandedTranscriptMaxLines,
     expandedTranscriptMaxBytes: limits.maxBytes ?? DEFAULT_CONFIG.expandedTranscriptMaxBytes,
+    contextUsage: summary.contextUsage,
     now,
   };
 }
@@ -321,6 +345,10 @@ export function readSessionFrameSummary(value: unknown): SessionFrameSummary | u
   const endedAt = value.endedAt;
   if (endedAt !== undefined && !isNonEmptyString(endedAt)) return undefined;
 
+  // A malformed context usage is dropped on its own; the rest of the summary
+  // still renders, so one bad value can never hide a frame.
+  const contextUsage = readContextUsage(value.contextUsage);
+
   return {
     frameId,
     ticketId,
@@ -333,6 +361,7 @@ export function readSessionFrameSummary(value: unknown): SessionFrameSummary | u
     errors: value.errors,
     startedAt,
     ...(endedAt === undefined ? {} : { endedAt }),
+    ...(contextUsage === undefined ? {} : { contextUsage }),
   };
 }
 
@@ -349,28 +378,84 @@ function headerSegments(view: SessionFrameView): SessionFrameSegment[] {
 
 function metaSegments(view: SessionFrameView): SessionFrameSegment[] {
   const elapsed = formatElapsed(view.startedAt, view.endedAt ?? view.now);
-  const parts = [
-    `${view.turns} turns`,
-    `${view.tools} tools`,
-    `${view.errors} errors`,
-    elapsed,
-    view.model ?? "unknown",
-    "(ctrl+o)",
+  const segments: SessionFrameSegment[] = [
+    { text: `${view.turns} turns • ${view.tools} tools • ${view.errors} errors`, tone: "dim" },
   ];
+
+  const usage = contextUsageSegment(view.contextUsage);
+  if (usage !== undefined) segments.push({ text: " • ", tone: "dim" }, usage);
+
+  segments.push({
+    text: ` • ${elapsed} • ${view.model ?? "unknown"} • (ctrl+o)`,
+    tone: "dim",
+  });
 
   // Only one command is advertised, and only while the child can still be
   // interrupted.
   if (view.status === "running" || view.status === "verifying") {
-    parts.push("/ticket-runner stop");
+    segments.push({ text: " • /ticket-runner stop", tone: "dim" });
   }
 
-  let text = parts.join(" • ");
   if (view.expanded) {
     const shortId = shortSessionId(view.childSessionFile);
-    if (shortId !== undefined) text = `Session ${shortId} · ${text}`;
+    if (shortId !== undefined) segments.unshift({ text: `Session ${shortId} · `, tone: "dim" });
   }
 
-  return [{ text, tone: "dim" }];
+  return segments;
+}
+
+/** Render the context-usage segment, or nothing when there is no window. */
+function contextUsageSegment(
+  usage: SessionFrameContextUsage | undefined,
+): SessionFrameSegment | undefined {
+  if (usage === undefined) return undefined;
+
+  const window = formatTokenCount(usage.contextWindow);
+  const text = usage.percent === null ? `?/${window}` : `${usage.percent.toFixed(1)}%/${window}`;
+
+  if (usage.percent !== null && usage.percent > 90) return { text, tone: "error" };
+  if (usage.percent !== null && usage.percent > 70) return { text, tone: "warning" };
+  return { text, tone: "dim" };
+}
+
+/** Abbreviate a token count like Pi's footer (`200k`, `1M`). */
+function formatTokenCount(count: number): string {
+  if (count < 1_000) return count.toString();
+  if (count < 10_000) return `${trimTrailingZero((count / 1_000).toFixed(1))}k`;
+  if (count < 1_000_000) return `${Math.round(count / 1_000)}k`;
+  if (count < 10_000_000) return `${trimTrailingZero((count / 1_000_000).toFixed(1))}M`;
+  return `${Math.round(count / 1_000_000)}M`;
+}
+
+/** Drop Pi's cosmetic `.0` so a round window reads `1M`, not `1.0M`. */
+function trimTrailingZero(text: string): string {
+  return text.endsWith(".0") ? text.slice(0, -2) : text;
+}
+
+/**
+ * Validate a persisted context usage as a unit.
+ *
+ * Absent and malformed values are both undefined; the caller keeps the rest of
+ * the summary either way.
+ */
+function readContextUsage(value: unknown): SessionFrameContextUsage | undefined {
+  if (!isRecord(value)) return undefined;
+
+  const contextWindow = value.contextWindow;
+  if (
+    typeof contextWindow !== "number" ||
+    !Number.isFinite(contextWindow) ||
+    contextWindow <= 0
+  ) {
+    return undefined;
+  }
+
+  const percent = value.percent;
+  if (percent !== null && (typeof percent !== "number" || !Number.isFinite(percent))) {
+    return undefined;
+  }
+
+  return { percent, contextWindow };
 }
 
 function contentLine(content: readonly SessionFrameSegment[], innerWidth: number): SessionFrameLine {

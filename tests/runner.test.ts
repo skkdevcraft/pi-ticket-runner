@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
+import type { ContextUsage, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { TicketRunnerError } from "../src/errors.ts";
@@ -12,7 +12,7 @@ import {
   type RepositoryGuard,
 } from "../src/repository.ts";
 import { TicketRunState } from "../src/run-state.ts";
-import type { SessionFrameStatus } from "../src/session-frame.ts";
+import type { SessionFrameChild, SessionFrameStatus } from "../src/session-frame.ts";
 import {
   hasImplementSkill,
   RunCancellation,
@@ -90,6 +90,7 @@ interface FakeSession extends TicketSession {
   subscribed: number;
   unsubscribed: number;
   lastText: string | undefined;
+  contextUsage: ContextUsage | undefined;
   emit(event: ChildEvent): void;
 }
 
@@ -116,6 +117,7 @@ function fakeSessionFactory(options: FakeSessionOptions = {}): {
         subscribed: 0,
         unsubscribed: 0,
         lastText: undefined,
+        contextUsage: undefined,
         emit(event) {
           for (const listener of listeners) listener(event);
         },
@@ -147,6 +149,9 @@ function fakeSessionFactory(options: FakeSessionOptions = {}): {
         },
         getTranscript() {
           return [];
+        },
+        getContextUsage() {
+          return session.contextUsage;
         },
         dispose() {
           session.disposed += 1;
@@ -971,14 +976,17 @@ describe("runTickets: session frame settlement", () => {
     readonly started: Array<{ ticketId: string; sessionFile: string | undefined; model: string | undefined }>;
     readonly settled: SessionFrameStatus[];
     readonly order: string[];
+    readonly children: SessionFrameChild[];
   }
 
   function frameRecorder(order: string[] = []): FrameRecorder {
     const started: FrameRecorder["started"] = [];
     const settled: SessionFrameStatus[] = [];
+    const children: SessionFrameChild[] = [];
     const observer = {
       ticketStarted() {},
-      frameStarted(value: Ticket, child: { sessionFile: string | undefined; model: string | undefined }) {
+      frameStarted(value: Ticket, child: SessionFrameChild) {
+        children.push(child);
         started.push({ ticketId: value.id, sessionFile: child.sessionFile, model: child.model });
         order.push("frame-start");
       },
@@ -992,8 +1000,36 @@ describe("runTickets: session frame settlement", () => {
       },
       betweenTickets() {},
     };
-    return { observer, started, settled, order };
+    return { observer, started, settled, order, children };
   }
+
+  it("exposes the child's context usage to the frame it starts", async () => {
+    const statuses = new Map([["01-ticket-01.md", "ready-for-agent"]]);
+    const usage: ContextUsage = { tokens: 84_200, contextWindow: 200_000, percent: 42.1 };
+    const fake = fakeSessionFactory({
+      responses: ["implemented", COMPLETE],
+      onPrompt: ({ promptIndex }) => {
+        if (promptIndex === 1) statuses.set("01-ticket-01.md", "resolved");
+      },
+    });
+    const frames = frameRecorder();
+
+    await runTickets(
+      options({
+        inventory: inventory(ticket("01", "ready-for-agent")),
+        createSession: async (sessionOptions) => {
+          const session = await fake.create(sessionOptions);
+          (session as FakeSession).contextUsage = usage;
+          return session;
+        },
+        readStatus: statusReader(statuses),
+        observer: frames.observer,
+      }),
+    );
+
+    assert.equal(frames.children.length, 1);
+    assert.deepEqual(frames.children[0]?.contextUsage?.(), usage);
+  });
 
   it("settles done only after a COMPLETE gate and a persisted status change", async () => {
     const order: string[] = [];

@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 
-import type { CustomEntry, SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
+import type {
+  ContextUsage,
+  CustomEntry,
+  SessionEntry,
+  Theme,
+} from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 
 import { DEFAULT_CONFIG } from "./config.ts";
@@ -15,6 +20,7 @@ import {
   readSessionFrameSummary,
   summaryToFrameView,
   type SessionFrameChild,
+  type SessionFrameContextUsage,
   type SessionFrameStatus,
   type SessionFrameSummary,
   type SessionFrameView,
@@ -79,6 +85,7 @@ export class LiveSessionFrame {
   private expandedOnce = false;
   private streamingText = "";
   private finalTranscript: readonly TranscriptEntry[] | undefined;
+  private contextUsage: SessionFrameContextUsage | undefined;
 
   constructor(
     ticket: Ticket,
@@ -94,6 +101,10 @@ export class LiveSessionFrame {
     this.child = child;
     this.startedAt = startedAt;
     this.limits = limits;
+
+    // Sampling at creation is deliberate: the meta line never gains or loses
+    // its segment mid-life, so it does not reflow while the child works.
+    this.refreshContextUsage();
   }
 
   get isSettled(): boolean {
@@ -112,6 +123,7 @@ export class LiveSessionFrame {
         break;
       case "tool_execution_end":
         if (event.isError) this.errors += 1;
+        this.refreshContextUsage();
         break;
       case "message_update":
         // Stream the visible assistant text into the expanded frame. Thinking
@@ -129,6 +141,9 @@ export class LiveSessionFrame {
       case "message_end":
         // The persisted assistant message now carries the text; keep the buffer
         // until the projection shows it so a synchronous repaint cannot flicker.
+        // An assistant message is also the boundary where the provider's token
+        // estimate lands.
+        if (event.message.role === "assistant") this.refreshContextUsage();
         break;
       case "agent_settled":
         break;
@@ -136,11 +151,16 @@ export class LiveSessionFrame {
   }
 
   gateStarted(): void {
-    if (!this.settled) this.status = "verifying";
+    if (this.settled) return;
+    this.refreshContextUsage();
+    this.status = "verifying";
   }
 
   settle(status: SessionFrameStatus, now: number): void {
     if (this.settled) return;
+    // Snapshot the value before the child is disposed so the persisted summary
+    // carries the last known context usage into teardown and reload.
+    this.refreshContextUsage();
     this.status = status;
     this.endedAt = now;
     // Snapshot the transcript before the child is disposed so a settled frame
@@ -163,6 +183,7 @@ export class LiveSessionFrame {
       errors: this.errors,
       startedAt: new Date(this.startedAt).toISOString(),
       ...(this.endedAt === undefined ? {} : { endedAt: new Date(this.endedAt).toISOString() }),
+      ...(this.contextUsage === undefined ? {} : { contextUsage: this.contextUsage }),
     };
   }
 
@@ -184,8 +205,35 @@ export class LiveSessionFrame {
       transcript: expanded ? this.transcript() : [],
       expandedTranscriptMaxLines: this.limits.maxLines,
       expandedTranscriptMaxBytes: this.limits.maxBytes,
+      contextUsage: this.contextUsage,
       now,
     };
+  }
+
+  /**
+   * Sample the child's context usage at a boundary.
+   *
+   * This is a display probe, not child work: a failing read keeps the previous
+   * snapshot and never raises a frame error or increments the error counter.
+   * An absent or window-less value is treated the same way, so a model without
+   * a context window never gains a segment and never shows a meaningless one.
+   */
+  private refreshContextUsage(): void {
+    const read = this.child.contextUsage;
+    if (read === undefined) return;
+
+    try {
+      const usage: ContextUsage | undefined = read();
+      if (usage === undefined) return;
+      if (!Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0) return;
+      if (usage.percent !== null && !Number.isFinite(usage.percent)) return;
+
+      // Token counts are dropped here: the meta line never displays them and
+      // the persisted summary stays a small counters-and-identity record.
+      this.contextUsage = { percent: usage.percent, contextWindow: usage.contextWindow };
+    } catch {
+      // Keep the last known value.
+    }
   }
 
   private transcript(): readonly TranscriptEntry[] {

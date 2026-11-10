@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import type {
+  ContextUsage,
   CustomEntry,
   EntryRenderer,
   ExtensionAPI,
@@ -30,6 +31,7 @@ import {
   textDelta,
   ticketMarkdown,
   toolStart,
+  toolEnd,
   turnEnd,
   type TempTree,
 } from "./helpers.ts";
@@ -395,6 +397,7 @@ interface FakeSession extends TicketSession {
   aborted: number;
   unsubscribed: number;
   lastText: string | undefined;
+  contextUsage: ContextUsage | undefined;
   emit(event: ChildEvent): void;
 }
 
@@ -444,10 +447,14 @@ function fakeSession(
         getTranscript() {
           return [];
         },
+        getContextUsage() {
+          return session.contextUsage;
+        },
         dispose() {
           session.disposed += 1;
         },
         lastText: undefined,
+        contextUsage: undefined,
       };
       created.push(session);
       return session;
@@ -1036,6 +1043,47 @@ describe("session frames and footer", () => {
     assert.ok(rendered);
     const lines = rendered.render(120);
     assert.ok(lines.some((line) => /01 First · Done/.test(line)));
+  });
+
+  it("persists context usage in the settlement summary and renders it after reload", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
+    const usage: ContextUsage = { tokens: 84_200, contextWindow: 200_000, percent: 42.1 };
+    const fake = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      (_prompt, index, session) => {
+        if (index !== 0) {
+          resolveTicket(tree, "01-first.md");
+          return;
+        }
+        session.contextUsage = usage;
+        session.emit(toolStart("edit"));
+        session.emit(toolEnd("edit"));
+        session.emit(turnEnd());
+      },
+    );
+    const pi = createFakePi(tree.path("agent"), { createSession: fake.create });
+
+    await pi.run("start issues", tree.root);
+
+    const frames = frameSummaries(pi);
+    assert.equal(frames[0]?.contextUsage, undefined, "live samples are not persisted");
+    assert.deepEqual(frames[1]?.contextUsage, { percent: 42.1, contextWindow: 200_000 });
+    assert.doesNotMatch(JSON.stringify(frames), /tokens/);
+
+    const [creation, settlement] = pi.entries;
+    assert.ok(creation);
+    assert.ok(settlement);
+    const reloaded = createFakePi(tree.path("agent"), {
+      initialEntries: [...pi.entries],
+    });
+    await reloaded.startSession(tree.root);
+
+    assert.equal(reloaded.renderEntry(creation), undefined);
+    const rendered = reloaded.renderEntry(settlement);
+    assert.ok(rendered);
+    const meta = rendered.render(160).find((line) => line.includes("errors"));
+    assert.match(meta ?? "", /0 errors • 42\.1%\/200k/);
   });
 
   it("settles the active frame as stopped before shutdown and clears the footer", async () => {

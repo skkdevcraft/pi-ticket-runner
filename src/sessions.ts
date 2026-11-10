@@ -6,6 +6,7 @@ import {
   DefaultResourceLoader,
   type AgentSession,
   type AgentSessionEvent,
+  type ContextUsage,
   type CreateAgentSessionOptions,
   type Extension,
   type LoadExtensionsResult,
@@ -32,6 +33,8 @@ export interface TicketSession {
   getLastAssistantText(): string | undefined;
   /** Read-only display projection of the child session's messages. */
   getTranscript(): readonly TranscriptEntry[];
+  /** Read-only estimate of the child's context usage, when one is available. */
+  getContextUsage(): ContextUsage | undefined;
   dispose(): void;
 }
 
@@ -133,6 +136,10 @@ class SdkTicketSession implements TicketSession {
 
   getTranscript(): readonly TranscriptEntry[] {
     return projectTranscript(this.session.sessionManager.getBranch());
+  }
+
+  getContextUsage(): ContextUsage | undefined {
+    return this.session.getContextUsage();
   }
 
   dispose(): void {
