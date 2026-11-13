@@ -10,6 +10,11 @@ import type {
 
 import { loadConfig } from "./config.ts";
 import { errorMessage, TicketRunnerError } from "./errors.ts";
+import {
+  createHerdrActivity,
+  type HerdrActivity,
+  type HerdrActivityFactory,
+} from "./herdr-activity.ts";
 import { RunFooterView, type RunObserver } from "./live-view.ts";
 import type { RepositoryGuard, RepositoryGuardFactory } from "./repository.ts";
 import { TicketRunState } from "./run-state.ts";
@@ -60,6 +65,8 @@ export interface RegisterCommandOptions {
   readonly state?: TicketRunState;
   /** Repository guard factory, injectable so start can be tested without Git. */
   readonly openGuard?: RepositoryGuardFactory;
+  /** Herdr pane activity factory, injectable so start can be tested without a process. */
+  readonly herdrActivity?: HerdrActivityFactory;
   /**
    * Receives the promise of a detached `start` run. Pi's interactive loop does
    * not read the next input line until a command handler settles, so the run
@@ -150,6 +157,7 @@ interface RunHooks {
   setCancellation(cancellation: RunCancellation | undefined): void;
   setFooter(footer: RunFooterView | undefined): void;
   setFrames(frames: SessionFrameController | undefined): void;
+  setHerdr(activity: HerdrActivity | undefined): void;
 }
 
 /** Register `/ticket-runner` with Pi. */
@@ -163,6 +171,7 @@ export function registerTicketRunnerCommand(
   let activeCancellation: RunCancellation | undefined;
   let activeFooter: RunFooterView | undefined;
   let activeFrames: SessionFrameController | undefined;
+  let activeHerdr: HerdrActivity | undefined;
 
   // Reloading or resuming a session rebuilds which summary entry is current for
   // every frame, so superseded summaries render nothing.
@@ -181,6 +190,8 @@ export function registerTicketRunnerCommand(
   // clear the footer, and never leave a repository locked. The run's own
   // cleanup releases the lock again (idempotently) once the abort settles.
   pi.on("session_shutdown", () => {
+    activeHerdr?.idle();
+    activeHerdr = undefined;
     activeFrames?.shutdown();
     activeGuard?.release();
     activeGuard = undefined;
@@ -231,6 +242,9 @@ export function registerTicketRunnerCommand(
           },
           setFrames: (frames) => {
             activeFrames = frames;
+          },
+          setHerdr: (activity) => {
+            activeHerdr = activity;
           },
         },
         frameRegistry,
@@ -388,9 +402,22 @@ async function runStart(
   });
   hooks.setFrames(frames);
 
+  // Herdr is optional: outside it the adapter's methods are no-ops. The root
+  // session reference rides on every report so restore still targets it.
+  const herdr = (options.herdrActivity ?? createHerdrActivity)({
+    session: {
+      id: ctx.sessionManager.getSessionId(),
+      path: ctx.sessionManager.getSessionFile(),
+    },
+  });
+  hooks.setHerdr(herdr);
+
+  let remainingRunnable = 0;
   const observer: RunObserver = {
-    ticketStarted: (ticket, remainingRunnable) => {
-      footer.ticketStarted(ticket, remainingRunnable);
+    ticketStarted: (ticket, remaining) => {
+      remainingRunnable = remaining;
+      footer.ticketStarted(ticket, remaining);
+      herdr.update({ ticket, remainingRunnable: remaining, phase: "implementing" });
     },
     frameStarted: (ticket, child) => {
       frames.start(ticket, child);
@@ -401,6 +428,7 @@ async function runStart(
     gateStarted: (ticket) => {
       footer.gateStarted(ticket);
       frames.gateStarted();
+      herdr.update({ ticket, remainingRunnable, phase: "verifying" });
     },
     frameSettled: (status) => {
       frames.settle(status);
@@ -458,6 +486,7 @@ async function runStart(
       { triggerTurn: false },
     );
   } finally {
+    herdr.idle();
     // A thrown failure still leaves a stopped frame and footer. A shutdown
     // clear wins because both views ignore later updates once torn down.
     if (outcome === undefined) {
@@ -468,6 +497,7 @@ async function runStart(
     if (hooks.getCancellation() === cancellation) hooks.setCancellation(undefined);
     hooks.setFrames(undefined);
     hooks.setFooter(undefined);
+    hooks.setHerdr(undefined);
   }
 }
 

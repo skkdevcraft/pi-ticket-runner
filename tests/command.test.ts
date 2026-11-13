@@ -15,6 +15,11 @@ import type { Component } from "@earendil-works/pi-tui";
 
 import { parseCommandArgs, registerTicketRunnerCommand } from "../src/command.ts";
 import { TicketRunnerError } from "../src/errors.ts";
+import type {
+  HerdrActivityFactory,
+  HerdrActivityOptions,
+  HerdrActivitySnapshot,
+} from "../src/herdr-activity.ts";
 import { FRAME_ENTRY_TYPE, type SessionFrameSummary } from "../src/session-frame.ts";
 import type {
   OpenRepositoryGuardOptions,
@@ -71,6 +76,36 @@ interface FakePiOptions {
   readonly extensionPath?: string;
   readonly openGuard?: RepositoryGuardFactory;
   readonly initialEntries?: readonly CustomEntry[];
+  readonly herdrActivity?: HerdrActivityFactory;
+}
+
+interface FakeHerdr {
+  readonly updates: HerdrActivitySnapshot[];
+  readonly sessions: Array<HerdrActivityOptions["session"]>;
+  idleCalls: number;
+  readonly factory: HerdrActivityFactory;
+}
+
+function fakeHerdr(): FakeHerdr {
+  const updates: HerdrActivitySnapshot[] = [];
+  const sessions: Array<HerdrActivityOptions["session"]> = [];
+  const fake: FakeHerdr = {
+    updates,
+    sessions,
+    idleCalls: 0,
+    factory: (options) => {
+      sessions.push(options.session);
+      return {
+        update: (activity) => {
+          updates.push(activity);
+        },
+        idle: () => {
+          fake.idleCalls += 1;
+        },
+      };
+    },
+  };
+  return fake;
 }
 
 function fakeRepositoryGuard(): RepositoryGuard {
@@ -141,6 +176,8 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
     },
     sessionManager: {
       getEntries: () => [...entries],
+      getSessionId: () => "root-session",
+      getSessionFile: () => "/sessions/root.jsonl",
     },
   }) as unknown as ExtensionCommandContext;
 
@@ -182,6 +219,7 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
     extensionPath: options.extensionPath ?? "/repo/index.ts",
     ...(options.createSession ? { createSession: options.createSession } : {}),
     openGuard: options.openGuard ?? fakeRepositoryGuard,
+    herdrActivity: options.herdrActivity ?? fakeHerdr().factory,
     observeRun: (run) => {
       detachedRuns.push(run);
     },
@@ -1221,6 +1259,171 @@ describe("session frames and footer", () => {
     });
     await refused.run("start issues", dirtyTree.root);
     assert.equal(refused.entries.length, 0);
+  });
+});
+
+describe("/ticket-runner Herdr activity", () => {
+  it("reports working for the ticket, the verifying phase, and idle when finished", async () => {
+    const tree = createTempTree();
+    tree.write("issues/02-second.md", ticketMarkdown({ title: "# 02: Second" }));
+    const herdr = fakeHerdr();
+    const fake = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      (_prompt, index) => {
+        if (index === 1) resolveTicket(tree, "02-second.md");
+      },
+    );
+    const pi = createFakePi(tree.path("agent"), {
+      createSession: fake.create,
+      herdrActivity: herdr.factory,
+    });
+
+    await pi.run("start issues", tree.root);
+
+    assert.deepEqual(
+      herdr.updates.map((activity) => [
+        activity.ticket.id,
+        activity.ticket.title,
+        activity.remainingRunnable,
+        activity.phase,
+      ]),
+      [
+        ["02", "Second", 1, "implementing"],
+        ["02", "Second", 1, "verifying"],
+      ],
+    );
+    assert.deepEqual(herdr.sessions, [
+      { id: "root-session", path: "/sessions/root.jsonl" },
+    ]);
+    assert.equal(herdr.idleCalls, 1);
+  });
+
+  it("goes idle when the completion gate stops the run", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown());
+    const herdr = fakeHerdr();
+    const fake = fakeSession([
+      "implemented",
+      "STATUS: INCOMPLETE\nREASON: the tests do not pass",
+    ]);
+    const pi = createFakePi(tree.path("agent"), {
+      createSession: fake.create,
+      herdrActivity: herdr.factory,
+    });
+
+    await pi.run("start issues", tree.root);
+
+    assert.equal(herdr.updates.at(-1)?.phase, "verifying");
+    assert.equal(herdr.idleCalls, 1);
+  });
+
+  it("goes idle when the child session cannot be created", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown());
+    const herdr = fakeHerdr();
+    const pi = createFakePi(tree.path("agent"), {
+      createSession: async () => {
+        throw new Error("session factory failed");
+      },
+      herdrActivity: herdr.factory,
+    });
+
+    await pi.run("start issues", tree.root);
+
+    assert.deepEqual(herdr.updates.map((activity) => activity.phase), [
+      "implementing",
+    ]);
+    assert.equal(herdr.idleCalls, 1);
+  });
+
+  it("goes idle when the user stops the run", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
+    tree.write("issues/02-second.md", ticketMarkdown({ title: "# 02: Second" }));
+    const herdr = fakeHerdr();
+    let pi: FakePi;
+    const fake = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      async (_prompt, index) => {
+        if (index === 0) await pi.run("stop", tree.root);
+      },
+    );
+    pi = createFakePi(tree.path("agent"), {
+      createSession: fake.create,
+      herdrActivity: herdr.factory,
+    });
+
+    await pi.run("start issues", tree.root);
+
+    assert.deepEqual(
+      herdr.updates.map((activity) => activity.ticket.id),
+      ["01"],
+    );
+    assert.equal(herdr.idleCalls, 1);
+  });
+
+  it("reports no ticket but still goes idle when nothing is runnable", async () => {
+    const tree = createTempTree();
+    tree.write(
+      "issues/01-first.md",
+      ticketMarkdown({ status: "Status: resolved" }),
+    );
+    const herdr = fakeHerdr();
+    const pi = createFakePi(tree.path("agent"), {
+      herdrActivity: herdr.factory,
+    });
+
+    await pi.run("start issues", tree.root);
+
+    assert.deepEqual(herdr.updates, []);
+    assert.equal(herdr.idleCalls, 1);
+  });
+
+  it("goes idle before cancelling the run on shutdown", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
+    const herdr = fakeHerdr();
+    let pi: FakePi;
+    let idleAtShutdown = 0;
+    const fake = fakeSession(
+      ["implemented", "STATUS: COMPLETE\nREASON: all checks pass"],
+      (_prompt, index) => {
+        if (index !== 0) {
+          resolveTicket(tree, "01-first.md");
+          return;
+        }
+        pi.shutdown();
+        idleAtShutdown = herdr.idleCalls;
+      },
+    );
+    pi = createFakePi(tree.path("agent"), {
+      createSession: fake.create,
+      herdrActivity: herdr.factory,
+    });
+
+    await pi.run("start issues", tree.root);
+
+    assert.equal(idleAtShutdown, 1);
+    assert.equal(herdr.updates[0]?.ticket.id, "01");
+  });
+
+  it("keeps the pre-ticket failure and reports no ticket", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown());
+    const herdr = fakeHerdr();
+    const fake = fakeSession(["unused"]);
+    const pi = createFakePi(tree.path("agent"), {
+      commands: [],
+      createSession: fake.create,
+      herdrActivity: herdr.factory,
+    });
+
+    await pi.run("start issues", tree.root);
+
+    assert.deepEqual(herdr.updates, []);
+    assert.equal(fake.created.length, 0);
+    assert.equal(pi.notifications[0]?.level, "error");
+    assert.match(pi.notifications[0]?.message ?? "", /skill:implement/);
   });
 });
 
