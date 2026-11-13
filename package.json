@@ -1,6 +1,6 @@
 {
   "name": "pi-ticket-runner",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "A Pi extension that runs Matt Pocock-skill tickets one by one, each in its own fresh session — so your main context never overflows.",
   "keywords": [
     "pi-package"

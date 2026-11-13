@@ -82,6 +82,20 @@ export function ticketMarkdown(options: {
   return [title, "", status, "", options.body ?? "Do the thing.", ""].join("\n");
 }
 
+/** Resolve once `predicate` is true, polling the event loop for a short while. */
+export async function waitFor(
+  predicate: () => boolean,
+  description = "condition",
+): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  if (predicate()) return;
+  throw new Error(`Timed out waiting for ${description}`);
+}
+
 /** A manual clock with controllable scheduled callbacks. */
 export interface FakeClock {
   /** The clock seam handed to a throttled repainter. */

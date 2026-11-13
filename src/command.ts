@@ -60,6 +60,13 @@ export interface RegisterCommandOptions {
   readonly state?: TicketRunState;
   /** Repository guard factory, injectable so start can be tested without Git. */
   readonly openGuard?: RepositoryGuardFactory;
+  /**
+   * Receives the promise of a detached `start` run. Pi's interactive loop does
+   * not read the next input line until a command handler settles, so the run
+   * must not be awaited by the handler; this is the seam tests use to observe
+   * the run's completion.
+   */
+  readonly observeRun?: ((run: Promise<void>) => void) | undefined;
 }
 
 /**
@@ -248,7 +255,7 @@ async function runCommand(
         runList(pi, options, state, ctx, command.folder);
         return;
       case "start":
-        await runStart(
+        startDetached(
           pi,
           options,
           state,
@@ -267,11 +274,55 @@ async function runCommand(
         return;
     }
   } catch (error) {
-    const message = error instanceof TicketRunnerError
-      ? error.message
-      : `Ticket runner failed: ${errorMessage(error)}`;
-    ctx.ui.notify(message, "error");
+    notifyCommandError(ctx, error);
   }
+}
+
+function notifyCommandError(ctx: ExtensionCommandContext, error: unknown): void {
+  const message = error instanceof TicketRunnerError
+    ? error.message
+    : `Ticket runner failed: ${errorMessage(error)}`;
+  ctx.ui.notify(message, "error");
+}
+
+/**
+ * Start a run without awaiting it.
+ *
+ * Pi executes an extension command handler inside the interactive input loop
+ * and waits for it to settle before reading the next submitted line. Awaiting
+ * the run here would therefore queue `/ticket-runner stop` (and `status`)
+ * behind the run it is meant to interrupt. The detached promise keeps the
+ * run's own cleanup and error reporting intact.
+ */
+function startDetached(
+  pi: ExtensionAPI,
+  options: RegisterCommandOptions,
+  state: TicketRunState,
+  ctx: ExtensionCommandContext,
+  folder: string,
+  allowDirty: boolean,
+  hooks: RunHooks,
+  frameRegistry: SessionFrameRegistry,
+): void {
+  if (hooks.getCancellation() !== undefined) {
+    ctx.ui.notify(
+      `A ticket run is already active.\nRun /${COMMAND_NAME} stop before starting another.`,
+      "warning",
+    );
+    return;
+  }
+
+  const run = runStart(
+    pi,
+    options,
+    state,
+    ctx,
+    folder,
+    allowDirty,
+    hooks,
+    frameRegistry,
+  ).catch((error: unknown) => notifyCommandError(ctx, error));
+  options.observeRun?.(run);
 }
 
 function runList(

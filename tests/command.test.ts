@@ -33,6 +33,7 @@ import {
   toolStart,
   toolEnd,
   turnEnd,
+  waitFor,
   type TempTree,
 } from "./helpers.ts";
 
@@ -54,6 +55,10 @@ interface FakePi {
   readonly registered: { readonly name?: string; readonly description?: string | undefined };
   readonly entries: CustomEntry[];
   run(args: string, cwd: string): Promise<void>;
+  /** Invoke the handler only, leaving a `start` run detached and in flight. */
+  runCommand(args: string, cwd: string): Promise<void>;
+  /** Await every detached `start` run started so far. */
+  settle(): Promise<void>;
   input(text: string, source?: "interactive" | "rpc" | "extension"): Promise<unknown>;
   shutdown(): void;
   startSession(cwd?: string): Promise<void>;
@@ -121,6 +126,7 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
   const notifications: Array<{ message: string; level: string }> = [];
   const uiCalls: UiCall[] = [];
   const entries: CustomEntry[] = [...(options.initialEntries ?? [])];
+  const detachedRuns: Promise<void>[] = [];
   const entryRenderers = new Map<string, EntryRenderer>();
   let entryCounter = options.initialEntries?.length ?? 0;
 
@@ -176,7 +182,18 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
     extensionPath: options.extensionPath ?? "/repo/index.ts",
     ...(options.createSession ? { createSession: options.createSession } : {}),
     openGuard: options.openGuard ?? fakeRepositoryGuard,
+    observeRun: (run) => {
+      detachedRuns.push(run);
+    },
   });
+
+  const runCommand = async (args: string, cwd: string): Promise<void> => {
+    assert.ok(handler, "command handler was not registered");
+    await handler(args, createContext(cwd));
+  };
+  const settle = async (): Promise<void> => {
+    await Promise.all(detachedRuns);
+  };
 
   return {
     sent,
@@ -199,9 +216,15 @@ function createFakePi(agentDir: string, options: FakePiOptions = {}): FakePi {
       }
       return result;
     },
+    runCommand,
+    settle,
     async run(args, cwd) {
-      assert.ok(handler, "command handler was not registered");
-      await handler(args, createContext(cwd));
+      // Capture the runs this invocation starts, then wait for them so
+      // assertions can observe the run's terminal effects. The handler itself
+      // still returns before the run settles, as it does in Pi.
+      const before = detachedRuns.length;
+      await runCommand(args, cwd);
+      await Promise.all(detachedRuns.slice(before));
     },
     renderEntry(entry, expanded = false) {
       const renderer = entryRenderers.get(entry.customType);
@@ -883,6 +906,67 @@ describe("/ticket-runner stop", () => {
     const summary = restarted.sent[restarted.sent.length - 1]?.message.content as string;
     assert.match(summary, /✅ Run finished/);
     assert.match(summary, /Ran: 01 First\./);
+  });
+});
+
+describe("/ticket-runner start responsiveness", () => {
+  it("returns before the run settles so a following stop is processed", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
+    let releasePrompt: (() => void) | undefined;
+    const fake = fakeSession(["unused"], async (_prompt, index) => {
+      if (index !== 0) return;
+      await new Promise<void>((resolve) => {
+        releasePrompt = resolve;
+      });
+    });
+    const pi = createFakePi(tree.path("agent"), { createSession: fake.create });
+
+    // Pi's input loop awaits the command handler before reading the next line.
+    // The handler must return while the child is still running.
+    await pi.runCommand("start issues", tree.root);
+    await waitFor(() => fake.created[0]?.prompts.length === 1, "the child prompt to start");
+    assert.equal(pi.sent.length, 0, "the run is still in flight after the handler returned");
+
+    // This is the command Pi only dispatches once the start handler settles.
+    await pi.run("stop", tree.root);
+    assert.equal(fake.created[0]?.aborted, 1, "stop must abort the live child");
+    assert.ok(releasePrompt, "the child prompt is still pending");
+    releasePrompt();
+
+    await pi.settle();
+
+    assert.equal(fake.created[0]?.disposed, 1);
+    const content = pi.sent[pi.sent.length - 1]?.message.content as string;
+    assert.match(content, /^⏹ Execution interrupted at 01 First/);
+  });
+
+  it("refuses a second start while a run is active", async () => {
+    const tree = createTempTree();
+    tree.write("issues/01-first.md", ticketMarkdown({ title: "# 01: First" }));
+    let releasePrompt: (() => void) | undefined;
+    const fake = fakeSession(["unused"], async (_prompt, index) => {
+      if (index !== 0) return;
+      await new Promise<void>((resolve) => {
+        releasePrompt = resolve;
+      });
+    });
+    const pi = createFakePi(tree.path("agent"), { createSession: fake.create });
+
+    await pi.runCommand("start issues", tree.root);
+    await waitFor(() => fake.created[0]?.prompts.length === 1, "the first child prompt");
+
+    await pi.run("start issues", tree.root);
+
+    assert.equal(fake.created.length, 1, "a second session must not be created");
+    const warning = pi.notifications.at(-1);
+    assert.equal(warning?.level, "warning");
+    assert.match(warning?.message ?? "", /A ticket run is already active/);
+    assert.match(warning?.message ?? "", /\/ticket-runner stop/);
+
+    await pi.run("stop", tree.root);
+    releasePrompt?.();
+    await pi.settle();
   });
 });
 
