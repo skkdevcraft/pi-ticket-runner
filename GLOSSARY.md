@@ -55,3 +55,7 @@ _Avoid_: failed, cancelled
 **Failed**:
 The session-frame status for a child-session error.
 _Avoid_: stopped, crashed
+
+**Pane activity**:
+The `idle`/`working` state and display metadata Herdr shows for the parent pane while a ticket run is active.
+_Avoid_: agent state, status (ambiguous with ticket and session-frame status)
